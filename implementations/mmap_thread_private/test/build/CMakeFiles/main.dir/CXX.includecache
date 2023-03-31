@@ -1,0 +1,22 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/fred/repos/tlb_shootdown/implementations/mmap_thread_private/test/main.cpp
+sys/mman.h
+-
+iostream
+-
+fcntl.h
+-
+cassert
+-
+thread_private_mmap.h
+/home/fred/repos/tlb_shootdown/implementations/mmap_thread_private/test/thread_private_mmap.h
+
+/home/fred/repos/tlb_shootdown/implementations/mmap_thread_private/test/thread_private_mmap.h
+

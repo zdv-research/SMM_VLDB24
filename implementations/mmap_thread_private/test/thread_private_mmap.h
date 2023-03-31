@@ -1,0 +1,6 @@
+#define BIT(nr)			(1UL << (nr))
+
+# define VM_THREAD_PRIVATE_BIT	50
+# define VM_THREAD_PRIVATE		BIT(VM_THREAD_PRIVATE_BIT)
+
+#define MAP_SMM	0x40000000

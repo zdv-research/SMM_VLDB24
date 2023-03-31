@@ -1,0 +1,4277 @@
+diff --git a/Makefile b/Makefile
+index 7b3ecdc..2a1475e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -636,6 +636,11 @@ ifneq ($(CONFIG_FRAME_WARN),0)
+ KBUILD_CFLAGS += $(call cc-option,-Wframe-larger-than=${CONFIG_FRAME_WARN})
+ endif
+ 
++# force no-pie for distro compilers that enable pie by default
++KBUILD_CFLAGS += $(call cc-option, -fno-pie)
++KBUILD_CFLAGS += $(call cc-option, -no-pie)
++KBUILD_AFLAGS += $(call cc-option, -fno-pie)
++
+ # Handle stack protector mode.
+ #
+ # Since kbuild can potentially perform two passes (first with the old
+diff --git a/arch/x86/Makefile b/arch/x86/Makefile
+index 4086abc..84d1cc8 100644
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -27,6 +27,7 @@ REALMODE_CFLAGS	:= $(M16_CFLAGS) -g -Os -D__KERNEL__ \
+ 		   -mno-mmx -mno-sse \
+ 		   $(call cc-option, -ffreestanding) \
+ 		   $(call cc-option, -fno-stack-protector) \
++		   $(call cc-option, -fno-pie) \
+ 		   $(call cc-option, -mpreferred-stack-boundary=2)
+ export REALMODE_CFLAGS
+ 
+@@ -129,7 +130,7 @@ endif
+ # Make sure compiler does not have buggy stack-protector support.
+ ifdef CONFIG_CC_STACKPROTECTOR
+ 	cc_has_sp := $(srctree)/scripts/gcc-x86_$(BITS)-has-stack-protector.sh
+-        ifneq ($(shell $(CONFIG_SHELL) $(cc_has_sp) $(CC) $(KBUILD_CPPFLAGS) $(biarch)),y)
++        ifneq ($(shell $(CONFIG_SHELL) $(cc_has_sp) $(CC) -fno-pie $(KBUILD_CPPFLAGS) $(biarch)),y)
+                 $(warning stack-protector enabled but compiler support broken)
+         endif
+ endif
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index c854541..3d0e8ce 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+@@ -45,6 +45,7 @@ export CPPFLAGS_vdso.lds += -P -C
+ VDSO_LDFLAGS_vdso.lds = -m64 -Wl,-soname=linux-vdso.so.1 \
+ 			-Wl,--no-undefined \
+ 			-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096 \
++			$(call ld-option, -no-pie) \
+ 			$(DISABLE_LTO)
+ 
+ $(obj)/vdso64.so.dbg: $(src)/vdso.lds $(vobjs) FORCE
+@@ -68,6 +69,7 @@ $(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
+ CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
+        $(filter -g%,$(KBUILD_CFLAGS)) $(call cc-option, -fno-stack-protector) \
+        -fno-omit-frame-pointer -foptimize-sibling-calls \
++       $(call cc-option, -fno-pie) \
+        -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
+ 
+ $(vobjs): KBUILD_CFLAGS += $(CFL)
+@@ -141,6 +143,7 @@ KBUILD_CFLAGS_32 := $(filter-out -mcmodel=kernel,$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 := $(filter-out -fno-pic,$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 := $(filter-out -mfentry,$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 += -m32 -msoft-float -mregparm=0 -fpic
++KBUILD_CFLAGS_32 += $(call cc-option, -no-pie)
+ KBUILD_CFLAGS_32 += $(call cc-option, -fno-stack-protector)
+ KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
+ KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
+diff --git a/arch/x86/include/asm/cpufeature.h b/arch/x86/include/asm/cpufeature.h
+index 7ad8c94..c7660d8 100644
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -393,6 +393,7 @@ extern const char * const x86_bug_flags[NBUGINTS*32];
+ #define cpu_has_fxsr		boot_cpu_has(X86_FEATURE_FXSR)
+ #define cpu_has_xmm		boot_cpu_has(X86_FEATURE_XMM)
+ #define cpu_has_xmm2		boot_cpu_has(X86_FEATURE_XMM2)
++#define cpu_has_pcid		boot_cpu_has(X86_FEATURE_PCID)
+ #define cpu_has_aes		boot_cpu_has(X86_FEATURE_AES)
+ #define cpu_has_avx		boot_cpu_has(X86_FEATURE_AVX)
+ #define cpu_has_avx2		boot_cpu_has(X86_FEATURE_AVX2)
+diff --git a/arch/x86/include/asm/mmu.h b/arch/x86/include/asm/mmu.h
+index 55234d5..6708586 100644
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@ -25,9 +25,9 @@ typedef struct {
+ } mm_context_t;
+ 
+ #ifdef CONFIG_SMP
+-void leave_mm(int cpu);
++bool leave_mm(int cpu);
+ #else
+-static inline void leave_mm(int cpu)
++static inline bool leave_mm(int cpu)
+ {
+ }
+ #endif
+diff --git a/arch/x86/include/asm/mmu_context.h b/arch/x86/include/asm/mmu_context.h
+index bfd9b2a..10014b7 100644
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@ -99,11 +99,22 @@ static inline void load_mm_ldt(struct mm_struct *mm)
+ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ #ifdef CONFIG_SMP
+-	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK)
++	if (this_cpu_read(cpu_tlbstate.state) <= TLBSTATE_NEARLY_LAZY)
+ 		this_cpu_write(cpu_tlbstate.state, TLBSTATE_LAZY);
+ #endif
+ }
+ 
++static inline void enter_nearly_lazy_tlb(struct mm_struct *mm,
++					 struct task_struct *tsk)
++{
++#ifdef CONFIG_SMP
++	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK) {
++		this_cpu_write(cpu_tlbstate.state, TLBSTATE_NEARLY_LAZY);
++		this_cpu_write(cpu_tlbstate.nearly_lazy_cnt, 0);
++	}
++#endif
++}
++
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 			     struct task_struct *tsk)
+ {
+@@ -113,6 +124,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ #ifdef CONFIG_SMP
+ 		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+ 		this_cpu_write(cpu_tlbstate.active_mm, next);
++		this_cpu_write(cpu_tlbstate.active_task, tsk);
+ #endif
+ 		cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+@@ -144,12 +156,15 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 		 * ordering guarantee we need.
+ 		 *
+ 		 */
++
+ 		load_cr3(next->pgd);
+ 
+ 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
+ 
+ 		/* Stop flush ipis for the previous mm */
+ 		cpumask_clear_cpu(cpu, mm_cpumask(prev));
++		if (cpumask_test_cpu(cpu, prev->cpu_vm_flush_mask_var))
++			cpumask_clear_cpu(cpu, prev->cpu_vm_flush_mask_var);
+ 
+ 		/* Load per-mm CR4 state */
+ 		load_mm_cr4(next);
+diff --git a/arch/x86/include/asm/paravirt.h b/arch/x86/include/asm/paravirt.h
+index f619250..d91e397 100644
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@ -321,12 +321,12 @@ static inline void __flush_tlb_single(unsigned long addr)
+ 	PVOP_VCALL1(pv_mmu_ops.flush_tlb_single, addr);
+ }
+ 
+-static inline void flush_tlb_others(const struct cpumask *cpumask,
+-				    struct mm_struct *mm,
+-				    unsigned long start,
+-				    unsigned long end)
++struct flush_tlb_info;
++struct flush_tlb_entry;
++
++static inline void flush_tlb_others(struct flush_tlb_info *info)
+ {
+-	PVOP_VCALL4(pv_mmu_ops.flush_tlb_others, cpumask, mm, start, end);
++	PVOP_VCALL1(pv_mmu_ops.flush_tlb_others, info);
+ }
+ 
+ static inline int paravirt_pgd_alloc(struct mm_struct *mm)
+diff --git a/arch/x86/include/asm/paravirt_types.h b/arch/x86/include/asm/paravirt_types.h
+index 77db561..7dc5d83 100644
+--- a/arch/x86/include/asm/paravirt_types.h
++++ b/arch/x86/include/asm/paravirt_types.h
+@@ -203,6 +203,8 @@ struct pv_irq_ops {
+ #endif
+ };
+ 
++struct flush_tlb_info;
++
+ struct pv_mmu_ops {
+ 	unsigned long (*read_cr2)(void);
+ 	void (*write_cr2)(unsigned long);
+@@ -225,10 +227,7 @@ struct pv_mmu_ops {
+ 	void (*flush_tlb_user)(void);
+ 	void (*flush_tlb_kernel)(void);
+ 	void (*flush_tlb_single)(unsigned long addr);
+-	void (*flush_tlb_others)(const struct cpumask *cpus,
+-				 struct mm_struct *mm,
+-				 unsigned long start,
+-				 unsigned long end);
++	void (*flush_tlb_others)(struct flush_tlb_info *info);
+ 
+ 	/* Hooks for allocating and freeing a pagetable top-level */
+ 	int  (*pgd_alloc)(struct mm_struct *mm);
+@@ -638,6 +637,12 @@ int paravirt_disable_iospace(void);
+ 		    "push %[_arg4];", "lea 4(%%esp),%%esp;",		\
+ 		    "0" ((u32)(arg1)), "1" ((u32)(arg2)),		\
+ 		    "2" ((u32)(arg3)), [_arg4] "mr" ((u32)(arg4)))
++#define PVOP_VCALL5(op, arg1, arg2, arg3, arg4, arg5)			\
++	__PVOP_VCALL(op,						\
++		    "push %[_arg5]; push %[_arg4];", "lea 8(%%esp),%%esp;",		\
++		    "0" ((u32)(arg1)), "1" ((u32)(arg2)),		\
++		    "2" ((u32)(arg3)), [_arg4] "mr" ((u32)(arg4)),	\
++		    [_arg5] "mr" ((u32)(arg5)))
+ #else
+ #define PVOP_CALL4(rettype, op, arg1, arg2, arg3, arg4)			\
+ 	__PVOP_CALL(rettype, op, "", "",				\
+@@ -647,6 +652,11 @@ int paravirt_disable_iospace(void);
+ 	__PVOP_VCALL(op, "", "",					\
+ 		     PVOP_CALL_ARG1(arg1), PVOP_CALL_ARG2(arg2),	\
+ 		     PVOP_CALL_ARG3(arg3), PVOP_CALL_ARG4(arg4))
++#define PVOP_VCALL5(op, arg1, arg2, arg3, arg4, arg5)			\
++	__PVOP_VCALL(op, "mov %[_arg5], %%r8;", "",			\
++		     PVOP_CALL_ARG1(arg1), PVOP_CALL_ARG2(arg2),	\
++		     PVOP_CALL_ARG3(arg3), PVOP_CALL_ARG4(arg4),	\
++		     [_arg5] "mr"(arg5))
+ #endif
+ 
+ /* Lazy mode for batching updates / context switch */
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 0687c47..559a87a 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -38,7 +38,19 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
+ extern spinlock_t pgd_lock;
+ extern struct list_head pgd_list;
+ 
++#define ZERO_EPTE(a) ({		epte_t __epte = {0};			\
++				__epte;	})
++#define UNCACHED_EPTE(a) ({	epte_t __epte = {.generation =  EPTE_GEN_UNCACHED};	\
++				__epte;	})
++
++
+ extern struct mm_struct *pgd_page_get_mm(struct page *page);
++extern pte_t remove_shadow_pte(unsigned long addr, pte_t ptent);
++
++static inline void  __set_epte(epte_t *eptep, epte_t epte)
++{
++	*eptep = epte;
++}
+ 
+ #ifdef CONFIG_PARAVIRT
+ #include <asm/paravirt.h>
+@@ -90,6 +102,20 @@ extern struct mm_struct *pgd_page_get_mm(struct page *page);
+ 
+ #endif	/* CONFIG_PARAVIRT */
+ 
++#define mk_pgd(page, pgprot)   pfn_pgd(page_to_pfn(page), (pgprot))
++#define mk_pud(page, pgprot)   pfn_pud(page_to_pfn(page), (pgprot))
++
++/*
++ * Currently stuck as a macro due to indirect forward reference to
++ * linux/mmzone.h's __section_mem_map_addr() definition:
++ */
++#define pmd_page(pmd)	pfn_to_page((pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT)
++
++static inline void __epte_clear(epte_t *eptep)
++{
++	eptep->val = 0;
++}
++
+ /*
+  * The following only work if pte_present() is true.
+  * Undefined behaviour if not..
+@@ -368,13 +394,25 @@ static inline pgprotval_t massage_pgprot(pgprot_t pgprot)
+ static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
+ {
+ 	return __pte(((phys_addr_t)page_nr << PAGE_SHIFT) |
+-		     massage_pgprot(pgprot));
++			massage_pgprot(pgprot));
+ }
+ 
+ static inline pmd_t pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
+ {
+ 	return __pmd(((phys_addr_t)page_nr << PAGE_SHIFT) |
+-		     massage_pgprot(pgprot));
++			massage_pgprot(pgprot));
++}
++
++static inline pud_t pfn_pud(unsigned long page_nr, pgprot_t pgprot)
++{
++	return __pud(((phys_addr_t)page_nr << PAGE_SHIFT) |
++			massage_pgprot(pgprot));
++}
++
++static inline pgd_t pfn_pgd(unsigned long page_nr, pgprot_t pgprot)
++{
++	return __pgd(((phys_addr_t)page_nr << PAGE_SHIFT) |
++			massage_pgprot(pgprot));
+ }
+ 
+ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+@@ -462,6 +500,50 @@ pte_t *populate_extra_pte(unsigned long vaddr);
+ #include <linux/mm_types.h>
+ #include <linux/mmdebug.h>
+ #include <linux/log2.h>
++#include <linux/page-flags.h>
++
++static inline epte_t *get_eptep(pte_t *ptep)
++{
++	struct page *page = virt_to_page((unsigned long)ptep);
++
++	if (!PageHasEPTES(page))
++		return NULL;
++
++	return &page->eptes[((unsigned long)(ptep) & ~PAGE_MASK) / 8];
++}
++
++static inline epte_t get_epte(pte_t *ptep)
++{
++	epte_t *pres = get_eptep(ptep);
++
++	if (pres != NULL)
++		return *pres;
++	return ZERO_EPTE(0);
++}
++
++static inline void epte_clear(struct mm_struct *mm, unsigned long addr,
++			      pte_t *ptep)
++{
++	epte_t *eptep = get_eptep(ptep);
++
++	pte_clear(mm, addr, ptep);
++
++	if (eptep)
++		__epte_clear(eptep);
++}
++
++static inline epte_t epte_get_and_clear(pte_t *ptep)
++{
++	epte_t *eptep, epte;
++
++	eptep = get_eptep(ptep);
++	if (eptep) {
++		epte = *eptep;
++		__set_epte(eptep, ZERO_EPTE(0));
++	} else
++		epte = ZERO_EPTE(0);
++	return epte;
++}
+ 
+ static inline int pte_none(pte_t pte)
+ {
+@@ -479,6 +561,27 @@ static inline int pte_present(pte_t a)
+ 	return pte_flags(a) & (_PAGE_PRESENT | _PAGE_PROTNONE);
+ }
+ 
++static inline pte_t pte_mk_unshadowed(pte_t pte, epte_t epte)
++{
++	if (epte.sw_young)
++		pte = pte_mkyoung(pte);
++	return pte;
++}
++
++static inline pte_t epte_mk_uncached(pte_t pte, epte_t *epte)
++{
++	if (pte_young(pte))
++		epte->sw_young = 1;
++	epte->generation = EPTE_GEN_UNCACHED;
++	epte->cpu_plus_one = 0;
++	return pte_mkold(pte);
++}
++
++static inline pte_t ptep_mk_unshadowed(pte_t *ptep)
++{
++	return pte_mk_unshadowed(*ptep, get_epte(ptep));
++}
++
+ #ifdef __HAVE_ARCH_PTE_DEVMAP
+ static inline int pte_devmap(pte_t a)
+ {
+@@ -546,13 +649,6 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ }
+ 
+ /*
+- * Currently stuck as a macro due to indirect forward reference to
+- * linux/mmzone.h's __section_mem_map_addr() definition:
+- */
+-#define pmd_page(pmd)		\
+-	pfn_to_page((pmd_val(pmd) & pmd_pfn_mask(pmd)) >> PAGE_SHIFT)
+-
+-/*
+  * the pmd page can be thought of an array like this: pmd_t[PTRS_PER_PMD]
+  *
+  * this macro returns the index of the entry in the pmd page which would
+@@ -735,6 +831,7 @@ static inline pmd_t native_local_pmdp_get_and_clear(pmd_t *pmdp)
+ static inline void native_set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 				     pte_t *ptep , pte_t pte)
+ {
++	/* XXX: get all the logic of push_to_tlb into here */
+ 	native_set_pte(ptep, pte);
+ }
+ 
+@@ -788,12 +885,22 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
+ 	return pte;
+ }
+ 
++static inline pte_t eptep_get_and_clear(struct mm_struct *mm,
++					unsigned long addr,
++					pte_t *ptep, epte_t *eptep)
++{
++	*eptep = epte_get_and_clear(ptep);
++	return ptep_get_and_clear(mm, addr, ptep);
++}
++
+ #define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
+-static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
++static inline pte_t eptep_get_and_clear_full(struct mm_struct *mm,
+ 					    unsigned long addr, pte_t *ptep,
+-					    int full)
++					    int full, epte_t *eptep)
+ {
+ 	pte_t pte;
++
++	*eptep = epte_get_and_clear(ptep);
+ 	if (full) {
+ 		/*
+ 		 * Full address destruction in progress; paravirt does not
+@@ -881,6 +988,39 @@ static inline unsigned long page_level_mask(enum pg_level level)
+ 	return ~(page_level_size(level) - 1);
+ }
+ 
++static inline void set_epte_at(struct mm_struct *mm, unsigned long addr,
++			       pte_t *ptep, pte_t pte, epte_t epte)
++{
++	epte_t *eptep = get_eptep(ptep);
++
++	if (eptep == NULL)
++		pte = pte_mk_unshadowed(pte, epte);
++
++	set_pte_at(mm, addr, ptep, pte);
++	if (eptep != NULL)
++		__set_epte(eptep, epte);
++}
++
++static inline pte_t epte_mk_reset(struct mm_struct *mm, pte_t pte,
++				  epte_t *epte, pte_t oldpte,
++				  bool keep_sw_young)
++{
++	if (pte_young(oldpte))
++		epte->cpu_plus_one = 0;
++
++	if (pte_young(oldpte) || epte->generation == EPTE_GEN_DISABLED)
++		epte->generation = atomic_read(&mm->flush_cnt);
++
++	if (!keep_sw_young)
++		epte->sw_young = 0;
++	epte->sw_young |= pte_young(pte);
++
++	/* no way to know who cached it */
++	pte = pte_mkold(pte);
++
++	return pte;
++}
++
+ /*
+  * The x86 doesn't have any external MMU info: the kernel page
+  * tables contain all the necessary information.
+diff --git a/arch/x86/include/asm/pgtable_64.h b/arch/x86/include/asm/pgtable_64.h
+index 2ee7811..bebe88c 100644
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@ -52,7 +52,7 @@ static inline void native_pte_clear(struct mm_struct *mm, unsigned long addr,
+ 
+ static inline void native_set_pte(pte_t *ptep, pte_t pte)
+ {
+-	*ptep = pte;
++	WRITE_ONCE(*ptep, pte);
+ }
+ 
+ static inline void native_set_pte_atomic(pte_t *ptep, pte_t pte)
+@@ -161,7 +161,10 @@ extern void cleanup_highmap(void);
+ #define HAVE_ARCH_UNMAPPED_AREA
+ #define HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
+ 
+-#define pgtable_cache_init()   do { } while (0)
++extern struct kmem_cache *epgtable_cache;
++
++extern void pgtable_cache_init(void);
++
+ #define check_pgt_cache()      do { } while (0)
+ 
+ #define PAGE_AGP    PAGE_KERNEL_NOCACHE
+diff --git a/arch/x86/include/asm/pgtable_64_types.h b/arch/x86/include/asm/pgtable_64_types.h
+index e6844df..f8f7d71 100644
+--- a/arch/x86/include/asm/pgtable_64_types.h
++++ b/arch/x86/include/asm/pgtable_64_types.h
+@@ -17,6 +17,22 @@ typedef unsigned long	pgprotval_t;
+ 
+ typedef struct { pteval_t pte; } pte_t;
+ 
++#define FLUSH_GEN_BITS		(7)
++#define FLUSH_GEN_MASK		((1UL << FLUSH_GEN_BITS) - 1)
++
++#define EPTE_GEN_DISABLED	(0x0)
++#define EPTE_GEN_UNCACHED	(0x1)
++#define EPTE_GEN_MIN		(0x2)
++
++typedef union {
++	struct {
++		unsigned short sw_young : 1;
++		unsigned short generation : FLUSH_GEN_BITS;
++		unsigned short cpu_plus_one : 8;
++	};
++	unsigned short val;
++} epte_t;
++
+ #endif	/* !__ASSEMBLY__ */
+ 
+ #define SHARED_KERNEL_PMD	0
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 20c11d1..1c2e800 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -206,6 +206,11 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
+ 	    : "memory");
+ }
+ 
++static inline void native_load_cr3_no_invd(pgd_t *pgdir)
++{
++	native_write_cr3(__pa(pgdir) | (1ULL << 63));
++}
++
+ static inline void load_cr3(pgd_t *pgdir)
+ {
+ 	write_cr3(__pa(pgdir));
+diff --git a/arch/x86/include/asm/tlb.h b/arch/x86/include/asm/tlb.h
+index c779730..de0e3a3 100644
+--- a/arch/x86/include/asm/tlb.h
++++ b/arch/x86/include/asm/tlb.h
+@@ -8,9 +8,9 @@
+ #define tlb_flush(tlb)							\
+ {									\
+ 	if (!tlb->fullmm && !tlb->need_flush_all) 			\
+-		flush_tlb_mm_range(tlb->mm, tlb->start, tlb->end, 0UL);	\
++		flush_tlb_mm_entries(&tlb->flush_info.info);		\
+ 	else								\
+-		flush_tlb_mm_range(tlb->mm, 0UL, TLB_FLUSH_ALL, 0UL);	\
++		flush_tlb_mm_range(tlb->mm, 0, TLB_FLUSH_ALL, 0UL);	\
+ }
+ 
+ #include <asm-generic/tlb.h>
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 6df2029..456f120 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -15,10 +15,122 @@
+ #define __flush_tlb_single(addr) __native_flush_tlb_single(addr)
+ #endif
+ 
++static inline int next_flush_gen(int gen)
++{
++	return max_t(int, EPTE_GEN_MIN, (gen + 1) & FLUSH_GEN_MASK);
++}
++
++static inline void finish_tlb_flush_tracking(struct mm_struct *mm, int cpu)
++{
++	int i;
++	cpumask_t temp, removed;
++	int nr_cpus;
++
++	if (!mm)
++		return;
++
++	/*
++	 * We may have missed flushes in the meanwhile; since we
++	 * anyhow need to check it is not empty, it is a good
++	 * time to check
++	 */
++	if (!cpumask_empty(mm->cpu_vm_flush_mask_var))
++		return;
++
++	if (!spin_trylock(&mm->flush_gen_lock))
++		return;
++
++	if (!cpumask_empty(mm->cpu_vm_flush_mask_var))
++		goto out;
++
++	/* open coded */
++	cpumask_copy(&temp, mm_cpumask(mm));
++	nr_cpus = nr_cpu_ids;
++	for (i = 0; i < (nr_cpus + BITS_PER_LONG - 1) / BITS_PER_LONG; i++) {
++		unsigned long *dst_bits = ((unsigned long *)cpumask_bits(mm->cpu_vm_flush_mask_var)) + i;
++		unsigned long *src_bits = ((unsigned long *)cpumask_bits(&temp)) + i;
++		xchg(dst_bits, *src_bits);
++	}
++	cpumask_copy(&temp,  mm->cpu_vm_flush_mask_var);
++	if (cpumask_andnot(&removed, &temp, mm_cpumask(mm))) {
++		for_each_cpu(i, &removed)
++			cpumask_clear_cpu(i, mm->cpu_vm_flush_mask_var);
++	}
++	atomic_set(&mm->flush_cnt,
++		   next_flush_gen(atomic_read(&mm->flush_cnt)));
++out:
++	spin_unlock(&mm->flush_gen_lock);
++}
++
++static inline void set_flush_tlb_n_pages(struct flush_tlb_entry *entry,
++					 unsigned long n_pages)
++{
++	entry->n_pages = min_t(unsigned long, TLB_FLUSH_ALL_LEN, n_pages);
++}
++
++static inline void add_flush_tlb_page(struct flush_tlb_entry *entry)
++{
++	set_flush_tlb_n_pages(entry, entry->n_pages + 1);
++}
++
++static inline void set_flush_tlb_entry_range(struct flush_tlb_entry *entry,
++				       unsigned long start, unsigned long end)
++{
++	entry->vpn = start >> PAGE_SHIFT;
++	set_flush_tlb_n_pages(entry,
++			      (end >> PAGE_SHIFT) - (start >> PAGE_SHIFT));
++}
++
++static inline void set_flush_tlb_entry_all_mm(struct flush_tlb_entry *entry)
++{
++	entry->mm = NULL;
++	entry->kernel = 0;
++	entry->cpu_specific = 0;
++}
++
++static inline void set_flush_tlb_entry_full(struct flush_tlb_entry *entry)
++{
++	entry->n_pages = TLB_FLUSH_ALL_LEN;
++}
++
++static inline
++unsigned long get_flush_tlb_entry_addr(const struct flush_tlb_entry *entry)
++{
++	return (unsigned long)(((long)entry->vpn << (BITS_PER_LONG - 36))
++						>> (BITS_PER_LONG - 48));
++}
++
++static inline unsigned long flush_tlb_entry_end(struct flush_tlb_entry *entry)
++{
++	return get_flush_tlb_entry_addr(entry) + (entry->n_pages << PAGE_SHIFT);
++}
++
++static inline void set_flush_tlb_entry_kernel(struct flush_tlb_entry *entry)
++{
++	entry->n_pages = TLB_FLUSH_ALL_LEN;
++	entry->mm = NULL;
++	entry->kernel = 1;
++}
++
++/* Each entry is either kernel, mm-specific or cpu-specific */
++static inline void set_flush_tlb_entry_mm(struct flush_tlb_entry *entry,
++					  struct mm_struct *mm)
++{
++	entry->mm = mm;
++	entry->kernel = 0;
++}
++
++static inline void set_flush_tlb_entry_current(struct flush_tlb_entry *entry)
++{
++	set_flush_tlb_entry_mm(entry, current->mm);
++}
++
+ struct tlb_state {
+ #ifdef CONFIG_SMP
+ 	struct mm_struct *active_mm;
++	struct task_struct *active_task;
+ 	int state;
++	int nearly_lazy_cnt;
+ #endif
+ 
+ 	/*
+@@ -26,6 +138,14 @@ struct tlb_state {
+ 	 * disabling interrupts when modifying either one.
+ 	 */
+ 	unsigned long cr4;
++
++	/* Direct-TLB stuff */
++	pgd_t *s_pgdp;
++	pud_t *s_pudp;
++	pmd_t *s_pmdp;
++	pte_t *s_ptep;
++	unsigned long s_last_ptep;
++	int generation;
+ };
+ DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
+ 
+@@ -86,7 +206,9 @@ static inline void cr4_set_bits_and_update_boot(unsigned long mask)
+ 
+ static inline void __native_flush_tlb(void)
+ {
++	preempt_disable();
+ 	native_write_cr3(native_read_cr3());
++	preempt_enable();
+ }
+ 
+ static inline void __native_flush_tlb_global_irq_disabled(void)
+@@ -209,10 +331,8 @@ static inline void flush_tlb_mm_range(struct mm_struct *mm,
+ 		__flush_tlb_up();
+ }
+ 
+-static inline void native_flush_tlb_others(const struct cpumask *cpumask,
+-					   struct mm_struct *mm,
+-					   unsigned long start,
+-					   unsigned long end)
++void native_flush_tlb_others(struct flush_tlb_info *info,
++			     struct flush_tlb_entry *entries)
+ {
+ }
+ 
+@@ -232,44 +352,153 @@ static inline void flush_tlb_kernel_range(unsigned long start,
+ 
+ #define local_flush_tlb() __flush_tlb()
+ 
+-#define flush_tlb_mm(mm)	flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL)
++#define flush_tlb_mm(mm)	flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, \
++						   0UL)
+ 
+ #define flush_tlb_range(vma, start, end)	\
+ 		flush_tlb_mm_range(vma->vm_mm, start, end, vma->vm_flags)
+ 
+ extern void flush_tlb_all(void);
++extern void flush_tlb_task(struct mm_struct *mm);
+ extern void flush_tlb_current_task(void);
+ extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
++extern void flush_tlb_page_cpu(struct vm_area_struct *, unsigned long, int);
+ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned long vmflag);
+ extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
++extern void flush_tlb_mm_entries(struct flush_tlb_info *info);
+ 
+ #define flush_tlb()	flush_tlb_current_task()
+ 
+-void native_flush_tlb_others(const struct cpumask *cpumask,
+-				struct mm_struct *mm,
+-				unsigned long start, unsigned long end);
++void native_flush_tlb_others(struct flush_tlb_info *info);
+ 
+-#define TLBSTATE_OK	1
+-#define TLBSTATE_LAZY	2
++#define TLBSTATE_OK		1
++#define TLBSTATE_NEARLY_LAZY	2
++#define TLBSTATE_LAZY		3
+ 
+ static inline void reset_lazy_tlbstate(void)
+ {
+ 	this_cpu_write(cpu_tlbstate.state, 0);
+ 	this_cpu_write(cpu_tlbstate.active_mm, &init_mm);
++	this_cpu_write(cpu_tlbstate.active_task, NULL);
+ }
+ 
++static inline int arch_can_push_to_tlb(pte_t pte)
++{
++	if ((pte_flags(pte) & (_PAGE_RW | _PAGE_DIRTY)) == _PAGE_RW)
++		return false;
++
++	return (pte_flags(pte) &
++		(_PAGE_NX | _PAGE_USER | _PAGE_GLOBAL |
++		 _PAGE_PRESENT)) == (_PAGE_NX | _PAGE_USER | _PAGE_PRESENT);
++}
++
++void arch_push_to_tlb(struct mm_struct *mm, unsigned long addr,
++		pmd_t *pmd, int n_entries);
++
+ #endif	/* SMP */
+ 
+-/* Not inlined due to inc_irq_stat not being defined yet */
+-#define flush_tlb_local() {		\
+-	inc_irq_stat(irq_tlb_count);	\
+-	local_flush_tlb();		\
++static inline bool pte_need_flush(struct mm_struct *mm, pte_t pte,
++				  epte_t epte, int *cpu)
++{
++	int cur_gen;
++
++	*cpu = -1;
++
++	if (pte_young(pte))
++		return true;
++
++	/* disabled - need on all, uncached - no need */
++	if (epte.generation < EPTE_GEN_MIN)
++		return epte.generation == EPTE_GEN_DISABLED;
++
++	cur_gen = atomic_read(&mm->flush_cnt);
++	if (epte.generation != cur_gen &&
++	    next_flush_gen(epte.generation) != cur_gen)
++		return false;
++
++	/* local to certain cpu */
++	*cpu = (int)epte.cpu_plus_one - 1;
++
++	return true;
++}
++
++static void tlb_flush_out_of_space(struct flush_tlb_info *info)
++{
++	struct flush_tlb_entry *entry;
++	/* If filled, replace with global entry */
++	info->n_entries = 1;
++	entry = &info->entries[0];
++
++	if (!info->same_mm)
++		set_flush_tlb_entry_all_mm(entry);
++	else {
++		entry->cpu_specific = 0;
++		BUG_ON(!entry->mm);
++		BUG_ON(entry->kernel);
++	}
++	entry->n_pages = TLB_FLUSH_ALL_LEN;
++}
++
++static inline void tlb_add_flush_range(struct flush_tlb_info *info,
++					 struct mm_struct *mm,
++					 unsigned long address,
++					 int cpu)
++{
++	struct flush_tlb_entry *entry;
++
++	/* make sure changes to the cpumask of mm are visible */
++	if (info->n_entries == 0)
++		goto new_entry;
++
++	if (++info->n_pages > 33)
++		tlb_flush_out_of_space(info);
++
++	entry = &info->entries[info->n_entries - 1];
++	if (!entry->mm) {
++		BUG_ON(entry->cpu_specific);
++		return;
++	}
++	if (entry->mm != mm) {
++		BUG_ON(info->same_mm);
++		goto try_new_entry;
++	}
++	if (cpu >= 0 && entry->cpu_specific && entry->cpu != cpu)
++		goto try_new_entry;
++	if (entry->n_pages == TLB_FLUSH_ALL_LEN)
++		goto found_matching;
++	if (flush_tlb_entry_end(entry) == address)
++		goto found_adjacent;
++
++	/* Create new entry */
++try_new_entry:
++	if (info->n_entries == N_TLB_FLUSH_ENTRIES) {
++		tlb_flush_out_of_space(info);
++		return;
++	}
++new_entry:
++	entry = &info->entries[info->n_entries++];
++	entry->vpn = address >> PAGE_SHIFT;
++	BUG_ON(get_flush_tlb_entry_addr(entry) != (address & PAGE_MASK));
++	entry->cpu_specific = 1;
++	entry->cpu = cpu;
++	set_flush_tlb_entry_mm(entry, mm);
++	entry->n_pages = 1;
++	entry->last = 0;
++	goto found_matching;
++found_adjacent:
++	set_flush_tlb_n_pages(entry, entry->n_pages + 1);
++found_matching:
++	if (cpu < 0)
++		entry->cpu_specific = 0;
+ }
+ 
+ #ifndef CONFIG_PARAVIRT
+-#define flush_tlb_others(mask, mm, start, end)	\
+-	native_flush_tlb_others(mask, mm, start, end)
++#define flush_tlb_others(info)	\
++	native_flush_tlb_others(info)
+ #endif
+ 
++extern int arch_init_sw_tlb(bool primary);
++extern void arch_deinit_sw_tlb(void);
++
+ #endif /* _ASM_X86_TLBFLUSH_H */
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 37830de..68f681e 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -287,6 +287,19 @@ static __always_inline void setup_smap(struct cpuinfo_x86 *c)
+ 	}
+ }
+ 
++static __always_inline void setup_pcid(struct cpuinfo_x86 *c)
++{
++	if (cpu_has(c, X86_FEATURE_PCID))
++		cr4_set_bits(X86_CR4_PCIDE);
++}
++
++static __init int setup_disable_pcid(char *arg)
++{
++	setup_clear_cpu_cap(X86_FEATURE_PCID);
++	return 1;
++}
++__setup("nopcid", setup_disable_pcid);
++
+ /*
+  * Some CPU features depend on higher CPUID levels, which may not always
+  * be available due to CPUID level capping or broken virtualization
+@@ -915,6 +928,7 @@ static void identify_cpu(struct cpuinfo_x86 *c)
+ 	/* Set up SMEP/SMAP */
+ 	setup_smep(c);
+ 	setup_smap(c);
++	setup_pcid(c);
+ 
+ 	/*
+ 	 * The vendor-specific functions might have changed features.
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 24d57f7..df94e73 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -248,6 +248,7 @@ static void notrace start_secondary(void *unused)
+ 	x86_cpuinit.setup_percpu_clockev();
+ 
+ 	wmb();
++	init_sw_tlb(false);
+ 	cpu_startup_entry(CPUHP_ONLINE);
+ }
+ 
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index e830c71..93a5e60 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1070,6 +1070,8 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
+ 	struct mm_struct *mm;
+ 	int fault, major = 0;
+ 	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
++	int nr_ptes = 0;
++	unsigned long pf_address = address;
+ 
+ 	tsk = current;
+ 	mm = tsk->mm;
+@@ -1242,7 +1244,7 @@ good_area:
+ 	 * the fault.  Since we never set FAULT_FLAG_RETRY_NOWAIT, if
+ 	 * we get VM_FAULT_RETRY back, the mmap_sem has been unlocked.
+ 	 */
+-	fault = handle_mm_fault(mm, vma, address, flags);
++	fault = _handle_mm_fault(mm, vma, &pf_address, flags, &nr_ptes);
+ 	major |= fault & VM_FAULT_MAJOR;
+ 
+ 	/*
+@@ -1286,6 +1288,9 @@ good_area:
+ 		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1, regs, address);
+ 	}
+ 
++	/* push now without a semaphore taken */
++	lockless_push_to_tlb(mm, pf_address, nr_ptes);
++
+ 	check_v8086_mode(regs, address, tsk);
+ }
+ NOKPROBE_SYMBOL(__do_page_fault);
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 5488d21..eeee60a 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -184,11 +184,15 @@ void sync_global_pgds(unsigned long start, unsigned long end, int removed)
+ 		list_for_each_entry(page, &pgd_list, lru) {
+ 			pgd_t *pgd;
+ 			spinlock_t *pgt_lock;
++			struct mm_struct *mm = pgd_page_get_mm(page);
+ 
+ 			pgd = (pgd_t *)page_address(page) + pgd_index(address);
+ 			/* the pgt_lock only for Xen */
+-			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
+-			spin_lock(pgt_lock);
++			if (mm) {
++				pgt_lock =
++					&pgd_page_get_mm(page)->page_table_lock;
++				spin_lock(pgt_lock);
++			}
+ 
+ 			if (!pgd_none(*pgd_ref) && !pgd_none(*pgd))
+ 				BUG_ON(pgd_page_vaddr(*pgd)
+@@ -202,7 +206,8 @@ void sync_global_pgds(unsigned long start, unsigned long end, int removed)
+ 					set_pgd(pgd, *pgd_ref);
+ 			}
+ 
+-			spin_unlock(pgt_lock);
++			if (mm)
++				spin_unlock(pgt_lock);
+ 		}
+ 		spin_unlock(&pgd_lock);
+ 	}
+@@ -363,6 +368,16 @@ void __init init_extra_mapping_uc(unsigned long phys, unsigned long size)
+ 	__init_extra_mapping(phys, size, _PAGE_CACHE_MODE_UC);
+ }
+ 
++struct kmem_cache *epgtable_cache;
++
++void __init pgtable_cache_init(void)
++{
++	epgtable_cache = kmem_cache_create("EPT_cache", sizeof(epte_t) * 512,
++					  sizeof(epte_t) * 512, 0, NULL);
++	if (epgtable_cache == NULL)
++		panic("Couldn't allocate pgtable caches");
++}
++
+ /*
+  * The head.S code sets up the kernel high mapping:
+  *
+@@ -830,7 +845,7 @@ remove_pte_table(pte_t *pte_start, unsigned long addr, unsigned long end,
+ 				free_pagetable(pte_page(*pte), 0);
+ 
+ 			spin_lock(&init_mm.page_table_lock);
+-			pte_clear(&init_mm, addr, pte);
++			epte_clear(&init_mm, addr, pte);
+ 			spin_unlock(&init_mm.page_table_lock);
+ 
+ 			/* For non-direct mapping, pages means nothing. */
+@@ -853,7 +868,7 @@ remove_pte_table(pte_t *pte_start, unsigned long addr, unsigned long end,
+ 				free_pagetable(pte_page(*pte), 0);
+ 
+ 				spin_lock(&init_mm.page_table_lock);
+-				pte_clear(&init_mm, addr, pte);
++				epte_clear(&init_mm, addr, pte);
+ 				spin_unlock(&init_mm.page_table_lock);
+ 			}
+ 		}
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+index 4eb287e..409885d 100644
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -5,6 +5,7 @@
+ #include <asm/tlb.h>
+ #include <asm/fixmap.h>
+ #include <asm/mtrr.h>
++#include <linux/slab.h>
+ 
+ #define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
+ 
+@@ -21,6 +22,14 @@ pte_t *pte_alloc_one_kernel(struct mm_struct *mm, unsigned long address)
+ 	return (pte_t *)__get_free_page(PGALLOC_GFP);
+ }
+ 
++void pte_alloc_eptes(struct page *pte)
++{
++	pte->eptes = kmem_cache_alloc(epgtable_cache, __userpte_alloc_gfp);
++
++	if (pte->eptes != NULL)
++		SetPageHasEPTES(pte);
++}
++
+ pgtable_t pte_alloc_one(struct mm_struct *mm, unsigned long address)
+ {
+ 	struct page *pte;
+@@ -32,6 +41,7 @@ pgtable_t pte_alloc_one(struct mm_struct *mm, unsigned long address)
+ 		__free_page(pte);
+ 		return NULL;
+ 	}
++	pte_alloc_eptes(pte);
+ 	return pte;
+ }
+ 
+@@ -54,6 +64,12 @@ early_param("userpte", setup_userpte);
+ 
+ void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
+ {
++	if (PageHasEPTES(pte)) {
++		BUG_ON(pte->eptes == NULL);
++		kmem_cache_free(epgtable_cache, pte->eptes);
++		pte->eptes = NULL;
++		ClearPageHasEPTES(pte);
++	}
+ 	pgtable_page_dtor(pte);
+ 	paravirt_release_pte(page_to_pfn(pte));
+ 	tlb_remove_page(tlb, pte);
+@@ -128,7 +144,8 @@ static void pgd_ctor(struct mm_struct *mm, pgd_t *pgd)
+ 
+ 	/* list required to sync kernel mapping updates */
+ 	if (!SHARED_KERNEL_PMD) {
+-		pgd_set_mm(pgd, mm);
++		if (mm != NULL)
++			pgd_set_mm(pgd, mm);
+ 		pgd_list_add(pgd);
+ 	}
+ }
+@@ -182,7 +199,8 @@ void pud_populate(struct mm_struct *mm, pud_t *pudp, pmd_t *pmd)
+ 	 * section 8.1: in PAE mode we explicitly have to flush the
+ 	 * TLB via cr3 if the top-level pgd is changed...
+ 	 */
+-	flush_tlb_mm(mm);
++	if (mm)
++		flush_tlb_mm(mm);
+ }
+ #else  /* !CONFIG_X86_PAE */
+ 
+@@ -199,7 +217,8 @@ static void free_pmds(struct mm_struct *mm, pmd_t *pmds[])
+ 		if (pmds[i]) {
+ 			pgtable_pmd_page_dtor(virt_to_page(pmds[i]));
+ 			free_page((unsigned long)pmds[i]);
+-			mm_dec_nr_pmds(mm);
++			if (mm)
++				mm_dec_nr_pmds(mm);
+ 		}
+ }
+ 
+@@ -217,7 +236,7 @@ static int preallocate_pmds(struct mm_struct *mm, pmd_t *pmds[])
+ 			pmd = NULL;
+ 			failed = true;
+ 		}
+-		if (pmd)
++		if (pmd && mm)
+ 			mm_inc_nr_pmds(mm);
+ 		pmds[i] = pmd;
+ 	}
+@@ -361,7 +380,8 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
+ 	if (pgd == NULL)
+ 		goto out;
+ 
+-	mm->pgd = pgd;
++	if (mm)
++		mm->pgd = pgd;
+ 
+ 	if (preallocate_pmds(mm, pmds) != 0)
+ 		goto out_free_pgd;
+@@ -413,7 +433,25 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
+ 	int changed = !pte_same(*ptep, entry);
+ 
+ 	if (changed && dirty) {
+-		*ptep = entry;
++		epte_t *eptep = get_eptep(ptep);
++		epte_t epte = get_epte(ptep);
++
++		if (eptep == NULL) {
++			set_pte(ptep, entry);
++		} else {
++			pte_t oldpte;
++
++			epte.sw_young = pte_young(entry);
++
++			entry = pte_mkold(entry);
++
++			oldpte = native_make_pte(xchg(&ptep->pte, entry.pte));
++			smp_mb__after_atomic();
++
++			epte_mk_reset(vma->vm_mm, entry, &epte, oldpte, true);
++			__set_epte(eptep, epte);
++		}
++
+ 		pte_update(vma->vm_mm, address, ptep);
+ 	}
+ 
+@@ -447,13 +485,26 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma,
+ 			      unsigned long addr, pte_t *ptep)
+ {
+ 	int ret = 0;
++	epte_t *eptep = get_eptep(ptep);
++	epte_t epte = get_epte(ptep);
+ 
+ 	if (pte_young(*ptep))
+ 		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+ 					 (unsigned long *) &ptep->pte);
+ 
+-	if (ret)
++	if (ret) {
++		smp_mb__after_atomic();
+ 		pte_update(vma->vm_mm, addr, ptep);
++		epte.cpu_plus_one = 0;
++		epte.generation = atomic_read(&vma->vm_mm->flush_cnt);
++	} else {
++		ret = epte.sw_young;
++	}
++
++	epte.sw_young = 0;
++
++	if (eptep != NULL)
++		__set_epte(eptep, epte);
+ 
+ 	return ret;
+ }
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 8f4cc3d..38a689a 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -6,12 +6,15 @@
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+ #include <linux/cpu.h>
++#include <linux/vmstat.h>
++#include <linux/kasan.h>
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/mmu_context.h>
+ #include <asm/cache.h>
+ #include <asm/apic.h>
+ #include <asm/uv/uv.h>
++#include <asm/arch_hweight.h>
+ #include <linux/debugfs.h>
+ 
+ /*
+@@ -28,24 +31,41 @@
+  *	Implement flush IPI by CALL_FUNCTION_VECTOR, Alex Shi
+  */
+ 
+-struct flush_tlb_info {
+-	struct mm_struct *flush_mm;
+-	unsigned long flush_start;
+-	unsigned long flush_end;
+-};
++/*
++ * See Documentation/x86/tlb.txt for details.  We choose 33
++ * because it is large enough to cover the vast majority (at
++ * least 95%) of allocations, and is small enough that we are
++ * confident it will not cause too much overhead.  Each single
++ * flush is about 100 ns, so this caps the maximum overhead at
++ * _about_ 3,000 ns.
++ *
++ * This is in units of pages.
++ */
++static unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
++
++static inline void init_tlb_flush_single(struct flush_tlb_info_single *i_single)
++{
++	struct flush_tlb_info *info = &i_single->info;
++
++	info->n_entries = 1;
++	info->same_mm = true;
++	info->n_pages = 0;
++}
+ 
+ /*
+  * We cannot call mmdrop() because we are in interrupt context,
+  * instead update mm->cpu_vm_mask.
+  */
+-void leave_mm(int cpu)
++bool leave_mm(int cpu)
+ {
+ 	struct mm_struct *active_mm = this_cpu_read(cpu_tlbstate.active_mm);
+ 	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK)
+ 		BUG();
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(active_mm))) {
+ 		cpumask_clear_cpu(cpu, mm_cpumask(active_mm));
++		cpumask_clear_cpu(cpu, active_mm->cpu_vm_flush_mask_var);
+ 		load_cr3(swapper_pg_dir);
++
+ 		/*
+ 		 * This gets called in the idle path where RCU
+ 		 * functions differently.  Tracing normally
+@@ -53,10 +73,288 @@ void leave_mm(int cpu)
+ 		 * specially here.
+ 		 */
+ 		trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++		return true;
+ 	}
++	return false;
+ }
+ EXPORT_SYMBOL_GPL(leave_mm);
+ 
++static inline pte_t native_pfn_pte(unsigned long page_nr, pgprot_t pgprot)
++{
++	return native_make_pte(((phys_addr_t)page_nr << PAGE_SHIFT) |
++		     massage_pgprot(pgprot));
++}
++
++static inline pud_t native_pfn_pud(unsigned long page_nr, pgprot_t pgprot)
++{
++	return native_make_pud(((phys_addr_t)page_nr << PAGE_SHIFT) |
++				massage_pgprot(pgprot));
++}
++
++static inline pmd_t native_pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
++{
++	return native_make_pmd(((phys_addr_t)page_nr << PAGE_SHIFT) |
++		     massage_pgprot(pgprot));
++}
++
++static inline pgd_t native_pfn_pgd(unsigned long page_nr, pgprot_t pgprot)
++{
++	return native_make_pgd(((phys_addr_t)page_nr << PAGE_SHIFT) |
++				massage_pgprot(pgprot));
++}
++
++void arch_push_to_tlb(struct mm_struct *mm, unsigned long addr,
++		      pmd_t *pmd, int n_entries)
++{
++	pgd_t *s_pgd, *s_pgdp;
++	pud_t *s_pud, *s_pudp;
++	pmd_t *s_pmd, *s_pmdp;
++	pte_t *s_ptep, *s_pte, *ptep;
++	epte_t *eptep;
++	bool restore_pgd, restore_pud;
++	int i, cpu, generation;
++	int first = 0;
++	int last = -1;
++	unsigned long last_ptep, start_addr;
++	pgprot_t pgprot = __pgprot(_PAGE_ACCESSED | _PAGE_RW | _PAGE_PRESENT |
++				   _PAGE_USER);
++	spinlock_t *ptl;
++
++	addr &= PAGE_MASK;
++	start_addr = addr;
++
++	ptl = pte_lockptr(mm, pmd);
++
++	preempt_disable();
++
++	ptep = pte_offset_map(pmd, addr);
++	eptep = get_eptep(ptep);
++	if (unlikely(!eptep)) {
++		pte_unmap(ptep);
++		goto out;
++	}
++#if 0
++	/* To be really safe, the following should be enabled */
++	__native_flush_tlb_single(addr);
++#endif
++
++	s_ptep = this_cpu_read(cpu_tlbstate.s_ptep);
++	s_pmdp = this_cpu_read(cpu_tlbstate.s_pmdp);
++	s_pudp = this_cpu_read(cpu_tlbstate.s_pudp);
++	s_pgdp = this_cpu_read(cpu_tlbstate.s_pgdp);
++
++	s_pgd = s_pgdp + pgd_index(addr);
++
++	cpu = smp_processor_id();
++	restore_pgd = !pgd_present(*s_pgd);
++	if (restore_pgd)
++		native_set_pgd(s_pgd,
++			native_pfn_pgd(__pa(s_pudp) >> PAGE_SHIFT, pgprot));
++	s_pud = pud_offset(s_pgd, addr);
++	restore_pud = !pud_present(*s_pud);
++	if (restore_pud)
++		native_set_pud(s_pud,
++			native_pfn_pud(__pa(s_pmdp) >> PAGE_SHIFT, pgprot));
++	s_pmd = pmd_offset(s_pud, addr);
++	native_set_pmd_at(mm, addr, s_pmd,
++			native_pfn_pmd(__pa(s_ptep) >> PAGE_SHIFT, pgprot));
++
++	spin_lock(ptl);
++	native_irq_disable();
++	generation = atomic_read(&mm->flush_cnt);
++
++	for (i = 0, s_pte = s_ptep + pte_index(addr);
++	     i < n_entries;
++	     i++, addr += PAGE_SIZE, ptep++, s_pte++, eptep++) {
++		pte_t pte = *ptep;
++		epte_t epte = *eptep;
++
++		if (!arch_can_push_to_tlb(pte) || pte_young(pte) ||
++		    epte.generation == EPTE_GEN_DISABLED) {
++			continue;
++		}
++
++		if (last < 0)
++			first = i;
++		last = i;
++
++		//epte.sw_young = 1;
++		pte = pte_mkyoung(pte);
++
++		native_set_pte_at(mm, addr, s_pte, pte);
++		if (epte.generation == EPTE_GEN_UNCACHED)
++			epte.cpu_plus_one = cpu + 1;
++		else if (epte.cpu_plus_one != cpu + 1)
++			epte.cpu_plus_one = 0;
++
++		epte.generation = generation;
++		__set_epte(eptep, epte);
++	}
++	pte_unmap_unlock(ptep-1, ptl);
++
++	if (last < 0)
++		goto out_irq_enable;
++
++	native_load_cr3_no_invd(s_pgdp); /* implicit barrier */
++	addr = start_addr + first * PAGE_SIZE;
++
++	for (i = first, s_pte = s_ptep + pte_index(addr);
++	     i <= last;
++	     i++, addr += PAGE_SIZE, s_pte++) {
++		if (!pte_present(*s_pte))
++			continue;
++
++		stac();
++		kasan_disable_current();
++		ACCESS_ONCE(*(__user int *)addr);
++		kasan_enable_current();
++		clac();
++
++		barrier();
++
++		/* pte_clear(mm, addr, s_pte); */
++		native_set_pte_at(mm, addr, s_pte, native_make_pte(0));
++	}
++	/* We can already release the lock */
++
++	barrier();
++	native_pmd_clear(s_pmd);
++	if (restore_pud)
++		native_pud_clear(s_pud);
++	if (restore_pgd)
++		native_pgd_clear(s_pgd);
++	native_load_cr3_no_invd(mm->pgd); /* implicit barrier */
++
++	/* local_irq_restore(flags); */
++out_irq_enable:
++	native_irq_enable();
++out:
++	preempt_enable();
++}
++
++/*
++ * See Documentation/x86/tlb.txt for details.  We choose 33
++ * because it is large enough to cover the vast majority (at
++ * least 95%) of allocations, and is small enough that we are
++ * confident it will not cause too much overhead.  Each single
++ * flush is about 100 ns, so this caps the maximum overhead at
++ * _about_ 3,000 ns.
++ *
++ * This is in units of pages.
++ */
++
++#define NEARLY_LAZY_CNT		(10)
++
++static bool remote_lazy_tlb_flush(void)
++{
++	bool flushed = false;
++	int state = this_cpu_read(cpu_tlbstate.state);
++
++	if ((state == TLBSTATE_NEARLY_LAZY) &&
++	    this_cpu_inc_return(cpu_tlbstate.nearly_lazy_cnt) >
++	    NEARLY_LAZY_CNT)
++		this_cpu_write(cpu_tlbstate.state, TLBSTATE_LAZY);
++
++	if (state == TLBSTATE_LAZY) {
++		leave_mm(smp_processor_id());
++		flushed = true;
++	}
++	return flushed;
++}
++
++static inline void flush_range_entry(const struct flush_tlb_entry *entry)
++{
++	int j;
++	unsigned long addr;
++
++	for (j = 0, addr = get_flush_tlb_entry_addr(entry);
++	     j < entry->n_pages; j++, addr += PAGE_SIZE) {
++		__flush_tlb_single(addr);
++	}
++}
++
++
++static void ___flush_tlb(struct flush_tlb_entry *entries, int trace_event)
++{
++	unsigned long n_pages = 0;
++	int cpu = smp_processor_id();
++	const struct flush_tlb_entry *entry =
++				(const struct flush_tlb_entry *)entries;
++	bool local = (trace_event != TLB_REMOTE_SHOOTDOWN);
++	struct mm_struct *mm;
++	int ceiling = tlb_single_page_flush_ceiling;
++	bool should_leave_mm = this_cpu_read(cpu_tlbstate.state) !=
++				TLBSTATE_OK;
++
++	/* kernel flushes have a single entry */
++	if (entry->kernel) {
++		if (entry->n_pages > ceiling) {
++			__flush_tlb_all();
++			if (should_leave_mm)
++				leave_mm(cpu);
++		} else
++			flush_range_entry(entry);
++		return;
++	}
++
++	/* leaving-mm cases */
++	if (local) {
++		if (!current->mm) {
++			leave_mm(cpu);
++			return;
++		}
++		mm = current->active_mm;
++	} else {
++		if (remote_lazy_tlb_flush())
++			return;
++		mm = this_cpu_read(cpu_tlbstate.active_mm);
++	}
++
++	/* specific */
++	do {
++		if (entry->mm && entry->mm != mm)
++			continue;
++		if (entry->cpu_specific && entry->cpu != cpu)
++			continue;
++
++		if (entry->n_pages > ceiling) {
++			/* We got the almost lazy thing, so check again */
++			if (should_leave_mm) {
++				leave_mm(cpu);
++				break;
++			}
++
++			if (local)
++				count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
++			trace_tlb_flush(trace_event, TLB_FLUSH_ALL);
++
++			if (cpumask_test_cpu(cpu, mm->cpu_vm_flush_mask_var))
++				cpumask_clear_cpu(cpu,
++						mm->cpu_vm_flush_mask_var);
++
++			/*
++			 * It is important that no PTE will be set between
++			 * clearing the PTE in the flush-mask and the actual
++			 * flush
++			 */
++
++			local_flush_tlb();
++			break;
++		}
++
++		/* entry specific */
++		flush_range_entry(entry);
++		n_pages += entry->n_pages;
++	} while (!(entry++)->last);
++
++	if (n_pages > 0) {
++		if (local)
++			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, n_pages);
++		trace_tlb_flush(trace_event, n_pages);
++	}
++}
++
++
+ /*
+  * The flush IPI assumes that a thread switch happens in this order:
+  * [cpu0: the cpu that switches]
+@@ -98,49 +396,23 @@ EXPORT_SYMBOL_GPL(leave_mm);
+  * 1) Flush the tlb entries if the cpu uses the mm that's being flushed.
+  * 2) Leave the mm if we are in the lazy tlb mode.
+  */
+-static void flush_tlb_func(void *info)
++static void flush_tlb_func(void *entries)
+ {
+-	struct flush_tlb_info *f = info;
+-
+ 	inc_irq_stat(irq_tlb_count);
+ 
+-	if (f->flush_mm != this_cpu_read(cpu_tlbstate.active_mm))
+-		return;
+-	if (!f->flush_end)
+-		f->flush_end = f->flush_start + PAGE_SIZE;
+-
+ 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+-	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK) {
+-		if (f->flush_end == TLB_FLUSH_ALL) {
+-			local_flush_tlb();
+-			trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, TLB_FLUSH_ALL);
+-		} else {
+-			unsigned long addr;
+-			unsigned long nr_pages =
+-				(f->flush_end - f->flush_start) / PAGE_SIZE;
+-			addr = f->flush_start;
+-			while (addr < f->flush_end) {
+-				__flush_tlb_single(addr);
+-				addr += PAGE_SIZE;
+-			}
+-			trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, nr_pages);
+-		}
+-	} else
+-		leave_mm(smp_processor_id());
+ 
++	___flush_tlb(entries, TLB_REMOTE_SHOOTDOWN);
+ }
+ 
+-void native_flush_tlb_others(const struct cpumask *cpumask,
+-				 struct mm_struct *mm, unsigned long start,
+-				 unsigned long end)
++void native_flush_tlb_others(struct flush_tlb_info *info)
+ {
+-	struct flush_tlb_info info;
+-	info.flush_mm = mm;
+-	info.flush_start = start;
+-	info.flush_end = end;
+-
+ 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
+-	trace_tlb_flush(TLB_REMOTE_SEND_IPI, end - start);
++
++	trace_tlb_flush(TLB_REMOTE_SEND_IPI, info->n_pages);
++
++	/* XXX: the following was disabled since I was lazy to adapt uv */
++#if 0
+ 	if (is_uv_system()) {
+ 		unsigned int cpu;
+ 
+@@ -151,155 +423,190 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
+ 								&info, 1);
+ 		return;
+ 	}
+-	smp_call_function_many(cpumask, flush_tlb_func, &info, 1);
++#endif
++	smp_call_function_many(&info->cpumask, flush_tlb_func, info->entries,
++				1);
+ }
+ 
+ void flush_tlb_current_task(void)
+ {
+-	struct mm_struct *mm = current->mm;
+-
+-	preempt_disable();
+-
+-	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
++	struct flush_tlb_info_single info_single;
++	struct flush_tlb_info *info = &info_single.info;
++	struct flush_tlb_entry *entry = &info->entries[0];
+ 
+-	/* This is an implicit full barrier that synchronizes with switch_mm. */
+-	local_flush_tlb();
++	init_tlb_flush_single(&info_single);
++	set_flush_tlb_entry_full(entry);
++	set_flush_tlb_entry_current(entry);
+ 
+-	trace_tlb_flush(TLB_LOCAL_SHOOTDOWN, TLB_FLUSH_ALL);
+-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
+-		flush_tlb_others(mm_cpumask(mm), mm, 0UL, TLB_FLUSH_ALL);
+-	preempt_enable();
++	flush_tlb_mm_entries(info);
+ }
+ 
+-/*
+- * See Documentation/x86/tlb.txt for details.  We choose 33
+- * because it is large enough to cover the vast majority (at
+- * least 95%) of allocations, and is small enough that we are
+- * confident it will not cause too much overhead.  Each single
+- * flush is about 100 ns, so this caps the maximum overhead at
+- * _about_ 3,000 ns.
+- *
+- * This is in units of pages.
+- */
+-static unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+-
+-void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+-				unsigned long end, unsigned long vmflag)
++/* We cannot defer the processing of the list since mm may change */
++static void flush_tlb_prolog(struct flush_tlb_info *info,
++					   int cpu)
+ {
+-	unsigned long addr;
+-	/* do a global flush by default */
+-	unsigned long base_pages_to_flush = TLB_FLUSH_ALL;
++	int i;
++	struct mm_struct *last_mm = NULL; /* last mm which was fully flushed */
+ 
+-	preempt_disable();
+-	if (current->active_mm != mm) {
+-		/* Synchronize with switch_mm. */
+-		smp_mb();
++	cpumask_clear(&info->cpumask);
+ 
+-		goto out;
+-	}
++	/* we may need to read mm_cpumask */
++	smp_mb();
+ 
+-	if (!current->mm) {
+-		leave_mm(smp_processor_id());
++	for (i = 0; i < info->n_entries; i++) {
++		struct flush_tlb_entry *entry = &info->entries[i];
++		struct mm_struct *mm = entry->mm;
+ 
+-		/* Synchronize with switch_mm. */
+-		smp_mb();
++		if (entry->kernel || !mm) {
++			/*
++			 * XXX: we could have hold a pointer to cpu_all_mask
++			 * but this case should not be a bottleneck
++			 */
++			cpumask_copy(&info->cpumask, cpu_all_mask);
++			BUG_ON(info->n_entries > 1);
++			break;
++		}
++		/* If we already did all the tracking */
++		if (mm == last_mm)
++			continue;
+ 
+-		goto out;
+-	}
++		if (entry->cpu_specific) {
++			if (entry->cpu != cpu &&
++			    atomic_read(&mm->mm_count) <= 1)
++				entry->n_pages = TLB_FLUSH_ALL_LEN;
+ 
+-	if ((end != TLB_FLUSH_ALL) && !(vmflag & VM_HUGETLB))
+-		base_pages_to_flush = (end - start) >> PAGE_SHIFT;
+-
+-	/*
+-	 * Both branches below are implicit full barriers (MOV to CR or
+-	 * INVLPG) that synchronize with switch_mm.
+-	 */
+-	if (base_pages_to_flush > tlb_single_page_flush_ceiling) {
+-		base_pages_to_flush = TLB_FLUSH_ALL;
+-		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+-		local_flush_tlb();
+-	} else {
+-		/* flush range by one by one 'invlpg' */
+-		for (addr = start; addr < end;	addr += PAGE_SIZE) {
+-			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ONE);
+-			__flush_tlb_single(addr);
++			__cpumask_set_cpu(entry->cpu, &info->cpumask);
++			continue;
++		}
++		if (mm) {
++			/*
++			 * we should find even if mm_cpumask changes.
++			 * if a CPU joined, then we flush more than promised.
++			 * if a CPU left, then anyhow it flushed
++			 */
++			cpumask_or(&info->cpumask, mm_cpumask(mm),
++				   &info->cpumask);
++
++			last_mm = mm;
+ 		}
+ 	}
+-	trace_tlb_flush(TLB_LOCAL_MM_SHOOTDOWN, base_pages_to_flush);
+-out:
+-	if (base_pages_to_flush == TLB_FLUSH_ALL) {
+-		start = 0UL;
+-		end = TLB_FLUSH_ALL;
++}
++
++static void flush_tlb_epilog(struct flush_tlb_info *info,
++				      int cpu)
++{
++	int i;
++
++	for (i = 0; i < info->n_entries; i++) {
++		struct flush_tlb_entry *entry = &info->entries[i];
++		struct mm_struct *mm = entry->mm;
++
++		finish_tlb_flush_tracking(mm, cpu);
+ 	}
+-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
+-		flush_tlb_others(mm_cpumask(mm), mm, start, end);
+-	preempt_enable();
+ }
+ 
+-void flush_tlb_page(struct vm_area_struct *vma, unsigned long start)
++void flush_tlb_mm_entries(struct flush_tlb_info *info)
+ {
+-	struct mm_struct *mm = vma->vm_mm;
++	int cpu;
++
++	if (info->n_entries == 0)
++		return;
++
++	BUG_ON(!info->entries);
++	info->entries[info->n_entries - 1].last = 1;
+ 
+ 	preempt_disable();
+ 
+-	if (current->active_mm == mm) {
+-		if (current->mm) {
+-			/*
+-			 * Implicit full barrier (INVLPG) that synchronizes
+-			 * with switch_mm.
+-			 */
+-			__flush_tlb_one(start);
+-		} else {
+-			leave_mm(smp_processor_id());
++	cpu = smp_processor_id();
++	flush_tlb_prolog(info, cpu);
+ 
+-			/* Synchronize with switch_mm. */
+-			smp_mb();
+-		}
+-	}
++	if (cpumask_test_cpu(cpu, &info->cpumask))
++		___flush_tlb(info->entries, TLB_LOCAL_MM_SHOOTDOWN);
+ 
+-	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
+-		flush_tlb_others(mm_cpumask(mm), mm, start, 0UL);
++	if (cpumask_any_but(&info->cpumask, cpu) < nr_cpu_ids)
++		flush_tlb_others(info);
++
++	flush_tlb_epilog(info, cpu);
+ 
+ 	preempt_enable();
+ }
+ 
+-static void do_flush_tlb_all(void *info)
++void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
++				unsigned long end, unsigned long vmflag)
+ {
+-	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+-	__flush_tlb_all();
+-	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_LAZY)
+-		leave_mm(smp_processor_id());
++	/* do a global flush by default */
++	struct flush_tlb_info_single info_single;
++	struct flush_tlb_info *info = &info_single.info;
++	struct flush_tlb_entry *entry = &info->entries[0];
++
++	if (end <= start)
++		return;
++
++	if (vmflag & VM_HUGETLB)
++		end = start + TLB_FLUSH_ALL_LEN;
++
++	init_tlb_flush_single(&info_single);
++	entry->cpu_specific = 0;
++	entry->cpu = 0; /* ignored */
++	set_flush_tlb_entry_mm(entry, mm);
++	set_flush_tlb_entry_range(entry, start, end);
++
++	flush_tlb_mm_entries(info);
+ }
+ 
+-void flush_tlb_all(void)
++static void __flush_tlb_page(struct vm_area_struct *vma, unsigned long start,
++			     int target)
+ {
+-	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
+-	on_each_cpu(do_flush_tlb_all, NULL, 1);
++	struct flush_tlb_info_single info_single;
++	struct flush_tlb_info *info = &info_single.info;
++	struct flush_tlb_entry *entry = &info->entries[0];
++
++	init_tlb_flush_single(&info_single);
++
++	set_flush_tlb_entry_range(entry, start, start + PAGE_SIZE);
++	set_flush_tlb_entry_mm(entry, vma->vm_mm);
++	entry->cpu_specific = (target >= 0);
++	entry->cpu = target;
++
++	flush_tlb_mm_entries(info);
+ }
+ 
+-static void do_kernel_range_flush(void *info)
++void flush_tlb_page(struct vm_area_struct *vma, unsigned long start)
+ {
+-	struct flush_tlb_info *f = info;
+-	unsigned long addr;
++	return __flush_tlb_page(vma, start, -1);
++}
+ 
+-	/* flush range by one by one 'invlpg' */
+-	for (addr = f->flush_start; addr < f->flush_end; addr += PAGE_SIZE)
+-		__flush_tlb_single(addr);
++void flush_tlb_page_cpu(struct vm_area_struct *vma, unsigned long start,
++			int cpu)
++{
++	return __flush_tlb_page(vma, start, cpu);
+ }
+ 
+-void flush_tlb_kernel_range(unsigned long start, unsigned long end)
++void flush_tlb_all(void)
+ {
++	struct flush_tlb_info_single info_single;
++	struct flush_tlb_info *info = &info_single.info;
++	struct flush_tlb_entry *entry = &info->entries[0];
++
++	init_tlb_flush_single(&info_single);
++	set_flush_tlb_entry_kernel(entry);
++	set_flush_tlb_entry_full(entry);
+ 
++	flush_tlb_mm_entries(info);
++}
++
++void flush_tlb_kernel_range(unsigned long start, unsigned long end)
++{
+ 	/* Balance as user space task's flush, a bit conservative */
+-	if (end == TLB_FLUSH_ALL ||
+-	    (end - start) > tlb_single_page_flush_ceiling * PAGE_SIZE) {
+-		on_each_cpu(do_flush_tlb_all, NULL, 1);
+-	} else {
+-		struct flush_tlb_info info;
+-		info.flush_start = start;
+-		info.flush_end = end;
+-		on_each_cpu(do_kernel_range_flush, &info, 1);
+-	}
++	struct flush_tlb_info_single info_single;
++	struct flush_tlb_info *info = &info_single.info;
++	struct flush_tlb_entry *entry = &info->entries[0];
++
++	init_tlb_flush_single(&info_single);
++	set_flush_tlb_entry_kernel(entry);
++	set_flush_tlb_entry_range(entry, start, end);
++
++	flush_tlb_mm_entries(info);
+ }
+ 
+ static ssize_t tlbflush_read_file(struct file *file, char __user *user_buf,
+@@ -347,3 +654,59 @@ static int __init create_tlb_single_page_flush_ceiling(void)
+ 	return 0;
+ }
+ late_initcall(create_tlb_single_page_flush_ceiling);
++
++static int tlb_task_migrate(struct notifier_block *nb, unsigned long l,
++			    void *v)
++{
++	struct task_migration_notifier *mn = v;
++
++	struct tlb_state *ts = &per_cpu(cpu_tlbstate, mn->from_cpu);
++
++	/* expedite TLB flush on task migration */
++	if (mn->task == ts->active_task) {
++		ts->active_task = NULL;
++		ts->nearly_lazy_cnt = TLBSTATE_NEARLY_LAZY;
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block tlb_migrate = {
++	.notifier_call = tlb_task_migrate,
++};
++
++int arch_init_sw_tlb(bool primary)
++{
++	pgd_t *s_pgdp = pgd_alloc(NULL);
++	pud_t *s_pudp = pud_alloc_one(NULL, 0);
++	pmd_t *s_pmdp = pmd_alloc_one(NULL, 0);
++	pte_t *s_ptep = pte_alloc_one_kernel(NULL, 0);
++
++	this_cpu_write(cpu_tlbstate.s_pgdp, pgd_alloc(NULL));
++	this_cpu_write(cpu_tlbstate.s_pudp, pud_alloc_one(NULL, 0));
++	this_cpu_write(cpu_tlbstate.s_pmdp, pmd_alloc_one(NULL, 0));
++	this_cpu_write(cpu_tlbstate.s_ptep, pte_alloc_one_kernel(NULL, 0));
++
++	if (!s_pgdp || !s_pudp || !s_pmdp || !s_ptep)
++		goto err;
++
++	this_cpu_write(cpu_tlbstate.generation, 0);
++	if (primary)
++		register_task_migration_notifier(&tlb_migrate);
++
++	return 0;
++err:
++	deinit_sw_tlb();
++	return -EINVAL;
++}
++
++void arch_deinit_sw_tlb(void)
++{
++	pte_free(NULL, virt_to_page(this_cpu_read(cpu_tlbstate.s_ptep)));
++	pmd_free(NULL, this_cpu_read(cpu_tlbstate.s_pmdp));
++	pud_free(NULL, this_cpu_read(cpu_tlbstate.s_pudp));
++	pgd_free(NULL, this_cpu_read(cpu_tlbstate.s_pgdp));
++	this_cpu_write(cpu_tlbstate.s_pgdp, NULL);
++	this_cpu_write(cpu_tlbstate.s_pudp, NULL);
++	this_cpu_write(cpu_tlbstate.s_pmdp, NULL);
++	this_cpu_write(cpu_tlbstate.s_ptep, NULL);
++}
+diff --git a/arch/x86/realmode/rm/reboot.S b/arch/x86/realmode/rm/reboot.S
+index d66c607..8db9f56 100644
+--- a/arch/x86/realmode/rm/reboot.S
++++ b/arch/x86/realmode/rm/reboot.S
+@@ -26,6 +26,11 @@ ENTRY(machine_real_restart_asm)
+ 	movl	%eax, %ds
+ 	lgdtl	pa_tr_gdt
+ 
++	/* Disable PCIDE */
++	movl	%cr4, %eax
++	andl	$~X86_CR4_PCIDE, %eax
++	movl	%eax, %cr4
++
+ 	/* Disable paging to drop us out of long mode */
+ 	movl	%cr0, %eax
+ 	andl	$~X86_CR0_PG, %eax
+@@ -92,6 +97,11 @@ GLOBAL(machine_real_restart_paging_off)
+ 	.balign	16
+ machine_real_restart_asm16:
+ 1:
++	/* Disable PCIDE */
++	movl	%cr4, %edx
++	andl	$~X86_CR4_PCIDE, %edx
++	movl	%eax, %cr4
++
+ 	xorl	%ecx, %ecx
+ 	movl	%cr0, %edx
+ 	andl	$0x00000011, %edx
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index fa95ab2..b1f9d29 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -862,13 +862,20 @@ static inline void clear_soft_dirty(struct vm_area_struct *vma,
+ 	pte_t ptent = *pte;
+ 
+ 	if (pte_present(ptent)) {
+-		ptent = ptep_modify_prot_start(vma->vm_mm, addr, pte);
++		epte_t epte;
++		pte_t oldpte;
++
++		ptent = eptep_modify_prot_start(vma->vm_mm, addr, pte, &epte);
++		smp_mb__after_atomic();
++		oldpte = ptent;
+ 		ptent = pte_wrprotect(ptent);
+ 		ptent = pte_clear_soft_dirty(ptent);
+-		ptep_modify_prot_commit(vma->vm_mm, addr, pte, ptent);
++		ptent = epte_mk_reset(vma->vm_mm, ptent, &epte, oldpte, true);
++
++		eptep_modify_prot_commit(vma->vm_mm, addr, pte, ptent, epte);
+ 	} else if (is_swap_pte(ptent)) {
+ 		ptent = pte_swp_clear_soft_dirty(ptent);
+-		set_pte_at(vma->vm_mm, addr, pte, ptent);
++		set_epte_at(vma->vm_mm, addr, pte, ptent, ZERO_EPTE(0));
+ 	}
+ }
+ #else
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index c370b26..5957f6d 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -146,12 +146,12 @@ static inline pmd_t pmdp_huge_get_and_clear_full(struct mm_struct *mm,
+ #endif
+ 
+ #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
+-static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
++static inline pte_t eptep_get_and_clear_full(struct mm_struct *mm,
+ 					    unsigned long address, pte_t *ptep,
+-					    int full)
++					    int full, epte_t *eptep)
+ {
+ 	pte_t pte;
+-	pte = ptep_get_and_clear(mm, address, ptep);
++	pte = eptep_get_and_clear(mm, address, ptep, epte);
+ 	return pte;
+ }
+ #endif
+@@ -162,12 +162,12 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
+  * not present, or in the process of an address space destruction.
+  */
+ #ifndef __HAVE_ARCH_PTE_CLEAR_NOT_PRESENT_FULL
+-static inline void pte_clear_not_present_full(struct mm_struct *mm,
++static inline void epte_clear_not_present_full(struct mm_struct *mm,
+ 					      unsigned long address,
+ 					      pte_t *ptep,
+ 					      int full)
+ {
+-	pte_clear(mm, address, ptep);
++	epte_clear(mm, address, ptep);
+ }
+ #endif
+ 
+@@ -177,6 +177,10 @@ extern pte_t ptep_clear_flush(struct vm_area_struct *vma,
+ 			      pte_t *ptep);
+ #endif
+ 
++extern pte_t eptep_clear_flush(struct vm_area_struct *vma,
++			      unsigned long address,
++			      pte_t *ptep, epte_t *epte);
++
+ #ifndef __HAVE_ARCH_PMDP_HUGE_CLEAR_FLUSH
+ extern pmd_t pmdp_huge_clear_flush(struct vm_area_struct *vma,
+ 			      unsigned long address,
+@@ -451,6 +455,30 @@ static inline void ptep_modify_prot_commit(struct mm_struct *mm,
+ 	__ptep_modify_prot_commit(mm, addr, ptep, pte);
+ }
+ #endif /* __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION */
++
++static inline pte_t eptep_modify_prot_start(struct mm_struct *mm,
++					   unsigned long addr,
++					   pte_t *ptep, epte_t *eptep)
++{
++	*eptep = get_epte(ptep);
++	return ptep_modify_prot_start(mm, addr, ptep);
++}
++
++static inline void eptep_modify_prot_commit(struct mm_struct *mm,
++					   unsigned long addr,
++					   pte_t *ptep, pte_t pte,
++					   epte_t epte)
++{
++	epte_t *eptep = get_eptep(ptep);
++
++	if (!eptep)
++		pte = pte_mk_unshadowed(pte, epte);
++	else
++		__set_epte(eptep, epte);
++	__ptep_modify_prot_commit(mm, addr, ptep, pte);
++}
++
++
+ #endif /* CONFIG_MMU */
+ 
+ /*
+diff --git a/include/asm-generic/tlb.h b/include/asm-generic/tlb.h
+index 9dbb739..244aeb8 100644
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@ -94,8 +94,6 @@ struct mmu_gather {
+ #ifdef CONFIG_HAVE_RCU_TABLE_FREE
+ 	struct mmu_table_batch	*batch;
+ #endif
+-	unsigned long		start;
+-	unsigned long		end;
+ 	/* we are in the middle of an operation to clear
+ 	 * a full mm and can make some optimizations */
+ 	unsigned int		fullmm : 1,
+@@ -107,6 +105,7 @@ struct mmu_gather {
+ 	struct mmu_gather_batch	local;
+ 	struct page		*__pages[MMU_GATHER_BUNDLE];
+ 	unsigned int		batch_count;
++	struct flush_tlb_info_multi	flush_info;
+ };
+ 
+ #define HAVE_GENERIC_MMU_GATHER
+@@ -128,20 +127,22 @@ static inline void tlb_remove_page(struct mmu_gather *tlb, struct page *page)
+ }
+ 
+ static inline void __tlb_adjust_range(struct mmu_gather *tlb,
+-				      unsigned long address)
++				      unsigned long address, int cpu)
+ {
+-	tlb->start = min(tlb->start, address);
+-	tlb->end = max(tlb->end, address + PAGE_SIZE);
++	tlb_add_flush_range(&tlb->flush_info.info, tlb->mm, address, cpu);
++}
++
++static inline void __tlb_reset_flush_tlb_info(struct flush_tlb_info *info,
++					      bool same_mm)
++{
++	info->n_entries = 0;
++	info->n_pages = 0;
++	info->same_mm = same_mm;
+ }
+ 
+ static inline void __tlb_reset_range(struct mmu_gather *tlb)
+ {
+-	if (tlb->fullmm) {
+-		tlb->start = tlb->end = ~0;
+-	} else {
+-		tlb->start = TASK_SIZE;
+-		tlb->end = 0;
+-	}
++	__tlb_reset_flush_tlb_info(&tlb->flush_info.info, true);
+ }
+ 
+ /*
+@@ -176,9 +177,9 @@ static inline void __tlb_reset_range(struct mmu_gather *tlb)
+  * so we can later optimise away the tlb invalidate.   This helps when
+  * userspace is unmapping already-unmapped pages, which happens quite a lot.
+  */
+-#define tlb_remove_tlb_entry(tlb, ptep, address)		\
++#define tlb_remove_tlb_entry(tlb, ptep, address, cpu)		\
+ 	do {							\
+-		__tlb_adjust_range(tlb, address);		\
++		__tlb_adjust_range(tlb, address, cpu);		\
+ 		__tlb_remove_tlb_entry(tlb, ptep, address);	\
+ 	} while (0)
+ 
+@@ -192,27 +193,27 @@ static inline void __tlb_reset_range(struct mmu_gather *tlb)
+ 
+ #define tlb_remove_pmd_tlb_entry(tlb, pmdp, address)		\
+ 	do {							\
+-		__tlb_adjust_range(tlb, address);		\
++		__tlb_adjust_range(tlb, address, -1);		\
+ 		__tlb_remove_pmd_tlb_entry(tlb, pmdp, address);	\
+ 	} while (0)
+ 
+ #define pte_free_tlb(tlb, ptep, address)			\
+ 	do {							\
+-		__tlb_adjust_range(tlb, address);		\
++		__tlb_adjust_range(tlb, address, -1);		\
+ 		__pte_free_tlb(tlb, ptep, address);		\
+ 	} while (0)
+ 
+ #ifndef __ARCH_HAS_4LEVEL_HACK
+ #define pud_free_tlb(tlb, pudp, address)			\
+ 	do {							\
+-		__tlb_adjust_range(tlb, address);		\
++		__tlb_adjust_range(tlb, address, -1);		\
+ 		__pud_free_tlb(tlb, pudp, address);		\
+ 	} while (0)
+ #endif
+ 
+ #define pmd_free_tlb(tlb, pmdp, address)			\
+ 	do {							\
+-		__tlb_adjust_range(tlb, address);		\
++		__tlb_adjust_range(tlb, address, -1);		\
+ 		__pmd_free_tlb(tlb, pmdp, address);		\
+ 	} while (0)
+ 
+diff --git a/include/linux/cpumask.h b/include/linux/cpumask.h
+index fc14275..ff2bd82 100644
+--- a/include/linux/cpumask.h
++++ b/include/linux/cpumask.h
+@@ -276,6 +276,11 @@ static inline void cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
+ 	set_bit(cpumask_check(cpu), cpumask_bits(dstp));
+ }
+ 
++static inline void __cpumask_set_cpu(unsigned int cpu, struct cpumask *dstp)
++{
++	__set_bit(cpumask_check(cpu), cpumask_bits(dstp));
++}
++
+ /**
+  * cpumask_clear_cpu - clear a cpu in a cpumask
+  * @cpu: cpu number (< nr_cpu_ids)
+@@ -286,6 +291,12 @@ static inline void cpumask_clear_cpu(int cpu, struct cpumask *dstp)
+ 	clear_bit(cpumask_check(cpu), cpumask_bits(dstp));
+ }
+ 
++static inline void __cpumask_clear_cpu(int cpu, struct cpumask *dstp)
++{
++	__clear_bit(cpumask_check(cpu), cpumask_bits(dstp));
++}
++
++
+ /**
+  * cpumask_test_cpu - test for a cpu in a cpumask
+  * @cpu: cpu number (< nr_cpu_ids)
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 516e149..3bec123 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -112,6 +112,9 @@ extern int overcommit_kbytes_handler(struct ctl_table *, int, void __user *,
+  */
+ 
+ extern struct kmem_cache *vm_area_cachep;
++extern struct kmem_cache *tlb_info_cachep;
++extern struct kmem_cache *mmu_gather_cachep;
++
+ 
+ #ifndef CONFIG_MMU
+ extern struct rb_root nommu_region_tree;
+@@ -553,8 +556,9 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ 	return pte;
+ }
+ 
+-void do_set_pte(struct vm_area_struct *vma, unsigned long address,
+-		struct page *page, pte_t *pte, bool write, bool anon);
++int do_set_pte(struct vm_area_struct *vma, unsigned long address,
++		struct page *page, pte_t *pte, bool write, bool anon,
++		unsigned int flags);
+ #endif
+ 
+ /*
+@@ -1217,6 +1221,10 @@ static inline int fixup_user_fault(struct task_struct *tsk,
+ }
+ #endif
+ 
++extern int _handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++			unsigned long *paddress, unsigned int flags,
++			int *nr_ptes);
++
+ extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, int write);
+ extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
+ 		void *buf, int len, int write);
+@@ -2367,5 +2375,11 @@ void __init setup_nr_node_ids(void);
+ static inline void setup_nr_node_ids(void) {}
+ #endif
+ 
++int init_sw_tlb(bool primary);
++void deinit_sw_tlb(void);
++
++void lockless_push_to_tlb(struct mm_struct *mm, unsigned long addr,
++			  int nr_ptes);
++
+ #endif /* __KERNEL__ */
+ #endif /* _LINUX_MM_H */
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 624b78b..d9517a8 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -64,6 +64,7 @@ struct page {
+ 			pgoff_t index;		/* Our offset within mapping. */
+ 			void *freelist;		/* sl[aou]b first free object */
+ 			/* page_deferred_list().prev	-- second tail page */
++			epte_t *eptes;		/* extended PTEs */
+ 		};
+ 
+ 		union {
+@@ -509,14 +510,29 @@ struct mm_struct {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	atomic_long_t hugetlb_usage;
+ #endif
+-};
++	atomic_t flush_cnt;
++	cpumask_var_t cpu_vm_flush_mask_var;
++#ifdef CONFIG_CPUMASK_OFFSTACK
++	struct cpumask cpumask_flush_allocation;
++#endif
++	spinlock_t flush_gen_lock;
++	/* aligned so we can save in the low bit TLB info */
++} __aligned(sizeof(unsigned long));
++
++static inline void mm_init_tlb_gen(struct mm_struct *mm)
++{
++	atomic_set(&mm->flush_cnt, EPTE_GEN_MIN);
++	spin_lock_init(&mm->flush_gen_lock);
++}
+ 
+ static inline void mm_init_cpumask(struct mm_struct *mm)
+ {
+ #ifdef CONFIG_CPUMASK_OFFSTACK
+ 	mm->cpu_vm_mask_var = &mm->cpumask_allocation;
++	mm->cpu_vm_flush_mask_var = &mm->cpumask_flush_allocation;
+ #endif
+ 	cpumask_clear(mm->cpu_vm_mask_var);
++	cpumask_clear(mm->cpu_vm_flush_mask_var);
+ }
+ 
+ /* Future-safe accessor for struct mm_struct's cpu_vm_mask. */
+diff --git a/include/linux/mmu_notifier.h b/include/linux/mmu_notifier.h
+index a1a210d..2f22630 100644
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@ -306,6 +306,20 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
+ 	if (mm_has_notifiers(mm))
+ 		__mmu_notifier_mm_destroy(mm);
+ }
++#define set_epte_at_notify(__mm, __address, __ptep, __pte, __epte)	\
++({									\
++	struct mm_struct *___mm = __mm;					\
++	unsigned long ___address = __address;				\
++	pte_t ___pte = __pte;						\
++	epte_t *___eptep = get_eptep(__ptep);				\
++									\
++	if (___eptep == NULL)						\
++		___pte = pte_mk_unshadowed(__pte, __epte);		\
++	mmu_notifier_change_pte(___mm, ___address, ___pte);		\
++	set_pte_at(___mm, ___address, __ptep, ___pte);			\
++	if (___eptep != NULL)						\
++		__set_epte(___eptep, __epte);				\
++})
+ 
+ #define ptep_clear_flush_young_notify(__vma, __address, __ptep)		\
+ ({									\
+@@ -368,6 +382,20 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
+ 	___pte;								\
+ })
+ 
++#define	eptep_clear_flush_notify(__vma, __address, __ptep, __eptep)	\
++({									\
++	unsigned long ___addr = __address & PAGE_MASK;			\
++	struct mm_struct *___mm = (__vma)->vm_mm;			\
++	pte_t ___pte;							\
++									\
++	___pte = eptep_clear_flush(__vma, __address, __ptep, __eptep);	\
++	mmu_notifier_invalidate_range(___mm, ___addr,			\
++					___addr + PAGE_SIZE);		\
++									\
++	___pte;								\
++})
++
++
+ #define pmdp_huge_clear_flush_notify(__vma, __haddr, __pmd)		\
+ ({									\
+ 	unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;		\
+@@ -474,6 +502,7 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
+ #define ptep_clear_young_notify ptep_test_and_clear_young
+ #define pmdp_clear_young_notify pmdp_test_and_clear_young
+ #define	ptep_clear_flush_notify ptep_clear_flush
++#define	eptep_clear_flush_notify eptep_clear_flush
+ #define pmdp_huge_clear_flush_notify pmdp_huge_clear_flush
+ #define pmdp_huge_get_and_clear_notify pmdp_huge_get_and_clear
+ #define set_pte_at_notify set_pte_at
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 19724e6..c2d9bf0 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -105,6 +105,7 @@ enum pageflags {
+ 	PG_young,
+ 	PG_idle,
+ #endif
++	PG_has_eptes,
+ 	__NR_PAGEFLAGS,
+ 
+ 	/* Filesystems */
+@@ -394,6 +395,8 @@ static inline int PageKsm(struct page *page)
+ TESTPAGEFLAG_FALSE(Ksm)
+ #endif
+ 
++PAGEFLAG(HasEPTES, has_eptes, PF_ANY) __CLEARPAGEFLAG(HasEPTES, has_eptes, PF_ANY)
++
+ u64 stable_page_flags(struct page *page);
+ 
+ static inline int PageUptodate(struct page *page)
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index a07f42b..1daf442 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -183,7 +183,8 @@ int page_referenced(struct page *, int is_locked,
+ 
+ #define TTU_ACTION(x) ((x) & TTU_ACTION_MASK)
+ 
+-int try_to_unmap(struct page *, enum ttu_flags flags);
++int try_to_unmap(struct page *, enum ttu_flags flags,
++		 struct tlbflush_unmap_batch *tlb_ubc);
+ 
+ /*
+  * Used by uprobes to replace a userspace page safely
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index a10494a..69891df 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -182,6 +182,13 @@ extern void update_cpu_load_nohz(int active);
+ static inline void update_cpu_load_nohz(int active) { }
+ #endif
+ 
++/* Notifier for when a task gets migrated to a new CPU */
++struct task_migration_notifier {
++	struct task_struct *task;
++	int from_cpu;
++	int to_cpu;
++};
++extern void register_task_migration_notifier(struct notifier_block *n);
+ extern unsigned long get_parent_ip(unsigned long addr);
+ 
+ extern void dump_cpu_task(int cpu);
+@@ -1367,14 +1374,45 @@ enum perf_event_task_context {
+ 	perf_nr_task_contexts,
+ };
+ 
++#define N_TLB_FLUSH_ENTRIES (32)
++
++#define TLB_FLUSH_LEN_BITS	(PAGE_SHIFT - 2)
++#define TLB_FLUSH_ALL_LEN	((1<<TLB_FLUSH_LEN_BITS)-1)
++
++#define TLB_FLUSH_CPU_BITS	(63)
++
++struct flush_tlb_entry {
++	struct mm_struct *mm;	/* may be redundant, but easier */
++	struct {
++		unsigned long n_pages : TLB_FLUSH_LEN_BITS;
++		unsigned long kernel : 1;
++		unsigned long last : 1;
++		unsigned long vpn : 36;	/* since x86 address is 48 bits */
++		unsigned long cpu : 12;
++		unsigned long cpu_specific : 1;
++	};
++};
++
++struct flush_tlb_info {
++	unsigned int n_entries;
++	unsigned short n_pages;
++	bool same_mm;
++	cpumask_t cpumask;
++	struct flush_tlb_entry entries[0];
++} __packed;
++
++struct flush_tlb_info_single {
++	struct flush_tlb_info info;
++	struct flush_tlb_entry __entry;
++} __packed;
++
++struct flush_tlb_info_multi {
++	struct flush_tlb_info info;
++	struct flush_tlb_entry __entries[N_TLB_FLUSH_ENTRIES];
++} __packed;
++
+ /* Track pages that require TLB flushes */
+ struct tlbflush_unmap_batch {
+-	/*
+-	 * Each bit set is a CPU that potentially has a TLB entry for one of
+-	 * the PFNs being flushed. See set_tlb_ubc_flush_pending().
+-	 */
+-	struct cpumask cpumask;
+-
+ 	/* True if any bit in cpumask is set */
+ 	bool flush_required;
+ 
+@@ -1384,6 +1422,8 @@ struct tlbflush_unmap_batch {
+ 	 * allows an update without redirtying the page.
+ 	 */
+ 	bool writable;
++
++	struct flush_tlb_info_multi flush_info;
+ };
+ 
+ struct task_struct {
+@@ -1749,10 +1789,6 @@ struct task_struct {
+ 	unsigned long numa_pages_migrated;
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+-#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+-	struct tlbflush_unmap_batch tlb_ubc;
+-#endif
+-
+ 	struct rcu_head rcu;
+ 
+ 	/*
+diff --git a/init/main.c b/init/main.c
+index 58c9e37..8718c75 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -87,6 +87,7 @@
+ #include <asm/setup.h>
+ #include <asm/sections.h>
+ #include <asm/cacheflush.h>
++#include <asm/tlbflush.h>
+ 
+ static int kernel_init(void *);
+ 
+@@ -526,6 +527,7 @@ asmlinkage __visible void __init start_kernel(void)
+ 	page_address_init();
+ 	pr_notice("%s", linux_banner);
+ 	setup_arch(&command_line);
++	mm_init_tlb_gen(&init_mm);
+ 	mm_init_cpumask(&init_mm);
+ 	setup_command_line(command_line);
+ 	setup_nr_cpu_ids();
+@@ -678,6 +680,7 @@ asmlinkage __visible void __init start_kernel(void)
+ 	}
+ 
+ 	ftrace_init();
++	init_sw_tlb(true);
+ 
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 0167679..05efaac 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -155,6 +155,7 @@ static int __replace_page(struct vm_area_struct *vma, unsigned long addr,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	spinlock_t *ptl;
+ 	pte_t *ptep;
++	epte_t epte;
+ 	int err;
+ 	/* For mmu_notifiers */
+ 	const unsigned long mmun_start = addr;
+@@ -186,8 +187,9 @@ static int __replace_page(struct vm_area_struct *vma, unsigned long addr,
+ 	}
+ 
+ 	flush_cache_page(vma, addr, pte_pfn(*ptep));
+-	ptep_clear_flush_notify(vma, addr, ptep);
+-	set_pte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot));
++	eptep_clear_flush_notify(vma, addr, ptep, &epte);
++	set_epte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot),
++			   ZERO_EPTE(0));
+ 
+ 	page_remove_rmap(page, false);
+ 	if (!page_mapped(page))
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 2e391c7..e943ab4 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -601,6 +601,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
+ 	mm->pinned_vm = 0;
+ 	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
+ 	spin_lock_init(&mm->page_table_lock);
++	mm_init_tlb_gen(mm);
+ 	mm_init_cpumask(mm);
+ 	mm_init_aio(mm);
+ 	mm_init_owner(mm, p);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 41f6b22..5b92f4d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1265,6 +1265,13 @@ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ }
+ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+ 
++static ATOMIC_NOTIFIER_HEAD(task_migration_notifier);
++
++void register_task_migration_notifier(struct notifier_block *n)
++{
++	atomic_notifier_chain_register(&task_migration_notifier, n);
++}
++
+ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ {
+ #ifdef CONFIG_SCHED_DEBUG
+@@ -1303,10 +1310,18 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ 	trace_sched_migrate_task(p, new_cpu);
+ 
+ 	if (task_cpu(p) != new_cpu) {
++		struct task_migration_notifier tmn;
++
+ 		if (p->sched_class->migrate_task_rq)
+ 			p->sched_class->migrate_task_rq(p);
+ 		p->se.nr_migrations++;
+ 		perf_event_task_migrate(p);
++
++		tmn.task = p;
++		tmn.from_cpu = task_cpu(p);
++		tmn.to_cpu = new_cpu;
++
++		atomic_notifier_call_chain(&task_migration_notifier, 0, &tmn);
+ 	}
+ 
+ 	__set_task_cpu(p, new_cpu);
+@@ -2783,7 +2798,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
+ 	if (!mm) {
+ 		next->active_mm = oldmm;
+ 		atomic_inc(&oldmm->mm_count);
+-		enter_lazy_tlb(oldmm, next);
++		enter_nearly_lazy_tlb(oldmm, next);
+ 	} else
+ 		switch_mm(oldmm, mm, next);
+ 
+diff --git a/mm/debug.c b/mm/debug.c
+index f05b2d5..c36fb37 100644
+--- a/mm/debug.c
++++ b/mm/debug.c
+@@ -44,6 +44,7 @@ static const struct trace_print_flags pageflag_names[] = {
+ 	{1UL << PG_young,		"young"		},
+ 	{1UL << PG_idle,		"idle"		},
+ #endif
++	{1UL << PG_has_eptes,		"has_eptes"	},
+ };
+ 
+ static void dump_flags(unsigned long flags,
+diff --git a/mm/filemap.c b/mm/filemap.c
+index da7a35d..5a76329 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2207,7 +2207,7 @@ repeat:
+ 		if (file->f_ra.mmap_miss > 0)
+ 			file->f_ra.mmap_miss--;
+ 		addr = address + (page->index - vmf->pgoff) * PAGE_SIZE;
+-		do_set_pte(vma, addr, page, pte, false, false);
++		do_set_pte(vma, addr, page, pte, false, false, vmf->flags);
+ 		unlock_page(page);
+ 		goto next;
+ unlock:
+diff --git a/mm/gup.c b/mm/gup.c
+index 7bf19ff..3146455 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -50,7 +50,8 @@ static int follow_pfn_pte(struct vm_area_struct *vma, unsigned long address,
+ 		entry = pte_mkyoung(entry);
+ 
+ 		if (!pte_same(*pte, entry)) {
+-			set_pte_at(vma->vm_mm, address, pte, entry);
++			set_epte_at(vma->vm_mm, address, pte, entry,
++				    ZERO_EPTE(0));
+ 			update_mmu_cache(vma, address, pte);
+ 		}
+ 	}
+diff --git a/mm/highmem.c b/mm/highmem.c
+index 123bcd3..19b107f 100644
+--- a/mm/highmem.c
++++ b/mm/highmem.c
+@@ -195,7 +195,7 @@ static void flush_all_zero_pkmaps(void)
+ 		 * So no dangers, even with speculative execution.
+ 		 */
+ 		page = pte_page(pkmap_page_table[i]);
+-		pte_clear(&init_mm, PKMAP_ADDR(i), &pkmap_page_table[i]);
++		epte_clear(&init_mm, PKMAP_ADDR(i), &pkmap_page_table[i]);
+ 
+ 		set_page_address(page, NULL);
+ 		need_flush = 1;
+@@ -259,8 +259,9 @@ start:
+ 		}
+ 	}
+ 	vaddr = PKMAP_ADDR(last_pkmap_nr);
+-	set_pte_at(&init_mm, vaddr,
+-		   &(pkmap_page_table[last_pkmap_nr]), mk_pte(page, kmap_prot));
++	set_epte_at(&init_mm, vaddr,
++		   &(pkmap_page_table[last_pkmap_nr]), mk_pte(page, kmap_prot),
++		   ZERO_EPTE(0));
+ 
+ 	pkmap_count[last_pkmap_nr] = 1;
+ 	set_page_address(page, (void *)vaddr);
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index e10a4fe..57ef7b0 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1201,7 +1201,7 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
+ 		lru_cache_add_active_or_unevictable(pages[i], vma);
+ 		pte = pte_offset_map(&_pmd, haddr);
+ 		VM_BUG_ON(!pte_none(*pte));
+-		set_pte_at(mm, haddr, pte, entry);
++		set_epte_at(mm, haddr, pte, entry, ZERO_EPTE(0));
+ 		pte_unmap(pte);
+ 	}
+ 	kfree(pages);
+@@ -2110,7 +2110,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
+ 				 * paravirt calls inside pte_clear here are
+ 				 * superfluous.
+ 				 */
+-				pte_clear(vma->vm_mm, address, _pte);
++				epte_clear(vma->vm_mm, address, _pte);
+ 				spin_unlock(ptl);
+ 			}
+ 		} else {
+@@ -2128,7 +2128,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
+ 			 * paravirt calls inside pte_clear here are
+ 			 * superfluous.
+ 			 */
+-			pte_clear(vma->vm_mm, address, _pte);
++			epte_clear(vma->vm_mm, address, _pte);
+ 			page_remove_rmap(src_page, false);
+ 			spin_unlock(ptl);
+ 			free_page_and_swap_cache(src_page);
+@@ -2820,7 +2820,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ 		entry = pte_mkspecial(entry);
+ 		pte = pte_offset_map(&_pmd, haddr);
+ 		VM_BUG_ON(!pte_none(*pte));
+-		set_pte_at(mm, haddr, pte, entry);
++		set_epte_at(mm, haddr, pte, entry, ZERO_EPTE(0));
+ 		pte_unmap(pte);
+ 	}
+ 	smp_wmb(); /* make pte visible before pmd */
+@@ -2889,7 +2889,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 			SetPageDirty(page + i);
+ 		pte = pte_offset_map(&_pmd, addr);
+ 		BUG_ON(!pte_none(*pte));
+-		set_pte_at(mm, addr, pte, entry);
++		set_epte_at(mm, addr, pte, entry, ZERO_EPTE(0));
+ 		atomic_inc(&page[i]._mapcount);
+ 		pte_unmap(pte);
+ 	}
+@@ -3086,6 +3086,7 @@ static void freeze_page_vma(struct vm_area_struct *vma, struct page *page,
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
+ 	for (i = 0; i < nr; i++, address += PAGE_SIZE, page++, pte++) {
+ 		pte_t entry, swp_pte;
++		epte_t epte;
+ 		swp_entry_t swp_entry;
+ 
+ 		/*
+@@ -3106,14 +3107,14 @@ static void freeze_page_vma(struct vm_area_struct *vma, struct page *page,
+ 		if (page_to_pfn(page) != pte_pfn(*pte))
+ 			continue;
+ 		flush_cache_page(vma, address, page_to_pfn(page));
+-		entry = ptep_clear_flush(vma, address, pte);
++		entry = eptep_clear_flush(vma, address, pte, &epte);
+ 		if (pte_dirty(entry))
+ 			SetPageDirty(page);
+ 		swp_entry = make_migration_entry(page, pte_write(entry));
+ 		swp_pte = swp_entry_to_pte(swp_entry);
+ 		if (pte_soft_dirty(entry))
+ 			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+-		set_pte_at(vma->vm_mm, address, pte, swp_pte);
++		set_epte_at(vma->vm_mm, address, pte, swp_pte, ZERO_EPTE(0));
+ 		page_remove_rmap(page, false);
+ 		put_page(page);
+ 	}
+@@ -3195,7 +3196,7 @@ static void unfreeze_page_vma(struct vm_area_struct *vma, struct page *page,
+ 			entry = maybe_mkwrite(entry, vma);
+ 
+ 		flush_dcache_page(page);
+-		set_pte_at(vma->vm_mm, address, pte, entry);
++		set_epte_at(vma->vm_mm, address, pte, entry, ZERO_EPTE(0));
+ 
+ 		/* No need to invalidate - it was non-present before */
+ 		update_mmu_cache(vma, address, pte);
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index aefba5a..026308b 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3184,7 +3184,7 @@ again:
+ 		}
+ 
+ 		pte = huge_ptep_get_and_clear(mm, address, ptep);
+-		tlb_remove_tlb_entry(tlb, ptep, address);
++		tlb_remove_tlb_entry(tlb, ptep, address, -1);
+ 		if (huge_pte_dirty(pte))
+ 			set_page_dirty(page);
+ 
+diff --git a/mm/internal.h b/mm/internal.h
+index a38a21e..0774b0d 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -455,8 +455,9 @@ enum ttu_flags;
+ struct tlbflush_unmap_batch;
+ 
+ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+-void try_to_unmap_flush(void);
+-void try_to_unmap_flush_dirty(void);
++void try_to_unmap_flush(struct tlbflush_unmap_batch *tlb_ubc);
++void try_to_unmap_flush_dirty(struct tlbflush_unmap_batch *tlb_ubc);
++void init_tlb_ubc(struct tlbflush_unmap_batch *tlb_ubc);
+ #else
+ static inline void try_to_unmap_flush(void)
+ {
+@@ -464,6 +465,9 @@ static inline void try_to_unmap_flush(void)
+ static inline void try_to_unmap_flush_dirty(void)
+ {
+ }
++static inline void init_tlb_ubc(struct tlbflush_unmap_batch *tlb_ubc)
++{
++}
+ 
+ #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
+ #endif	/* __MM_INTERNAL_H */
+diff --git a/mm/ksm.c b/mm/ksm.c
+index ca6d2a0..791789d 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -865,6 +865,7 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
+ 
+ 	if (pte_write(*ptep) || pte_dirty(*ptep)) {
+ 		pte_t entry;
++		epte_t epte;
+ 
+ 		swapped = PageSwapCache(page);
+ 		flush_cache_page(vma, addr, page_to_pfn(page));
+@@ -877,19 +878,21 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
+ 		 * this assure us that no O_DIRECT can happen after the check
+ 		 * or in the middle of the check.
+ 		 */
+-		entry = ptep_clear_flush_notify(vma, addr, ptep);
++		entry = eptep_clear_flush_notify(vma, addr, ptep, &epte);
++		entry = epte_mk_uncached(entry, &epte);
++
+ 		/*
+ 		 * Check that no O_DIRECT or similar I/O is in progress on the
+ 		 * page
+ 		 */
+ 		if (page_mapcount(page) + 1 + swapped != page_count(page)) {
+-			set_pte_at(mm, addr, ptep, entry);
++			set_epte_at(mm, addr, ptep, entry, epte);
+ 			goto out_unlock;
+ 		}
+ 		if (pte_dirty(entry))
+ 			set_page_dirty(page);
+ 		entry = pte_mkclean(pte_wrprotect(entry));
+-		set_pte_at_notify(mm, addr, ptep, entry);
++		set_epte_at_notify(mm, addr, ptep, entry, epte);
+ 	}
+ 	*orig_pte = *ptep;
+ 	err = 0;
+@@ -922,6 +925,8 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 	int err = -EFAULT;
+ 	unsigned long mmun_start;	/* For mmu_notifiers */
+ 	unsigned long mmun_end;		/* For mmu_notifiers */
++	pte_t pte;
++	epte_t epte;
+ 
+ 	addr = page_address_in_vma(page, vma);
+ 	if (addr == -EFAULT)
+@@ -945,8 +950,11 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 	page_add_anon_rmap(kpage, vma, addr, false);
+ 
+ 	flush_cache_page(vma, addr, pte_pfn(*ptep));
+-	ptep_clear_flush_notify(vma, addr, ptep);
+-	set_pte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot));
++	eptep_clear_flush_notify(vma, addr, ptep, &epte);
++	epte = UNCACHED_EPTE(0);
++	pte = epte_mk_uncached(mk_pte(kpage, vma->vm_page_prot), &epte);
++	set_epte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot),
++			   epte);
+ 
+ 	page_remove_rmap(page, false);
+ 	if (!page_mapped(page))
+diff --git a/mm/madvise.c b/mm/madvise.c
+index f56825b..425ff98 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -269,6 +269,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 	struct vm_area_struct *vma = walk->vma;
+ 	spinlock_t *ptl;
+ 	pte_t *orig_pte, *pte, ptent;
++	epte_t eptent;
+ 	struct page *page;
+ 	int nr_swap = 0;
+ 	unsigned long next;
+@@ -284,6 +285,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	arch_enter_lazy_mmu_mode();
+ 	for (; addr != end; pte++, addr += PAGE_SIZE) {
++		eptent = get_epte(pte);
+ 		ptent = *pte;
+ 
+ 		if (pte_none(ptent))
+@@ -301,7 +303,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 				continue;
+ 			nr_swap--;
+ 			free_swap_and_cache(entry);
+-			pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
++			epte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+ 			continue;
+ 		}
+ 
+@@ -360,22 +362,40 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 			unlock_page(page);
+ 		}
+ 
+-		if (pte_young(ptent) || pte_dirty(ptent)) {
++		if (pte_young(ptent) || pte_dirty(ptent) || eptent.sw_young) {
++			int cpu = -1;
++			bool need_flush = true;
++			pte_t oldpte;
++
+ 			/*
+ 			 * Some of architecture(ex, PPC) don't update TLB
+ 			 * with set_pte_at and tlb_remove_tlb_entry so for
+ 			 * the portability, remap the pte with old|clean
+ 			 * after pte clearing.
+ 			 */
+-			ptent = ptep_get_and_clear_full(mm, addr, pte,
+-							tlb->fullmm);
+-
++			ptent = eptep_get_and_clear_full(mm, addr, pte,
++							 tlb->fullmm, &eptent);
++			oldpte = ptent;
+ 			ptent = pte_mkold(ptent);
+ 			ptent = pte_mkclean(ptent);
+-			set_pte_at(mm, addr, pte, ptent);
++
++			if (!tlb->fullmm) {
++				smp_mb__after_atomic();
++				need_flush = pte_need_flush(mm, oldpte,
++							    eptent, &cpu);
++				if (need_flush)
++					ptent = epte_mk_reset(mm, ptent,
++							&eptent, oldpte, false);
++				else
++					ptent = epte_mk_uncached(ptent,
++								 &eptent);
++			}
++
++			set_epte_at(mm, addr, pte, ptent, eptent);
+ 			if (PageActive(page))
+ 				deactivate_page(page);
+-			tlb_remove_tlb_entry(tlb, pte, addr);
++			if (need_flush)
++				tlb_remove_tlb_entry(tlb, pte, addr, cpu);
+ 		}
+ 	}
+ out:
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index ac595e7..973006e 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -972,7 +972,7 @@ static int hwpoison_user_mappings(struct page *p, unsigned long pfn,
+ 	if (kill)
+ 		collect_procs(hpage, &tokill, flags & MF_ACTION_REQUIRED);
+ 
+-	ret = try_to_unmap(hpage, ttu);
++	ret = try_to_unmap(hpage, ttu, NULL);
+ 	if (ret != SWAP_SUCCESS)
+ 		printk(KERN_ERR "MCE %#lx: failed to unmap page (mapcount=%d)\n",
+ 				pfn, page_mapcount(hpage));
+diff --git a/mm/memory.c b/mm/memory.c
+index 8132787..711fd9c 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -237,11 +237,12 @@ void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long
+ 
+ static void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+ {
+-	if (!tlb->end)
++	if (tlb->flush_info.info.n_entries == 0)
+ 		return;
+ 
+ 	tlb_flush(tlb);
+-	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
++	/* TODO: get the minimum and maximum */
++	mmu_notifier_invalidate_range(tlb->mm, 0, TASK_SIZE);
+ #ifdef CONFIG_HAVE_RCU_TABLE_FREE
+ 	tlb_table_flush(tlb);
+ #endif
+@@ -295,8 +296,6 @@ int __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
+ {
+ 	struct mmu_gather_batch *batch;
+ 
+-	VM_BUG_ON(!tlb->end);
+-
+ 	batch = tlb->active;
+ 	batch->pages[batch->nr++] = page;
+ 	if (batch->nr == batch->max) {
+@@ -805,6 +804,7 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ {
+ 	unsigned long vm_flags = vma->vm_flags;
+ 	pte_t pte = *src_pte;
++	epte_t epte = get_epte(src_pte);
+ 	struct page *page;
+ 
+ 	/* pte contains position in swap or file, so copy. */
+@@ -839,7 +839,8 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 				pte = swp_entry_to_pte(entry);
+ 				if (pte_swp_soft_dirty(*src_pte))
+ 					pte = pte_swp_mksoft_dirty(pte);
+-				set_pte_at(src_mm, addr, src_pte, pte);
++				set_epte_at(src_mm, addr, src_pte, pte,
++					    ZERO_EPTE(0));
+ 			}
+ 		}
+ 		goto out_set_pte;
+@@ -861,6 +862,7 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 	if (vm_flags & VM_SHARED)
+ 		pte = pte_mkclean(pte);
+ 	pte = pte_mkold(pte);
++	pte = epte_mk_uncached(pte, &epte);
+ 
+ 	page = vm_normal_page(vma, addr, pte);
+ 	if (page) {
+@@ -870,7 +872,7 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 	}
+ 
+ out_set_pte:
+-	set_pte_at(dst_mm, addr, dst_pte, pte);
++	set_epte_at(dst_mm, addr, dst_pte, pte, epte);
+ 	return 0;
+ }
+ 
+@@ -1085,6 +1087,9 @@ again:
+ 
+ 		if (pte_present(ptent)) {
+ 			struct page *page;
++			int cpu = -1;
++			bool need_flush = true;
++			epte_t eptent;
+ 
+ 			page = vm_normal_page(vma, addr, ptent);
+ 			if (unlikely(details) && page) {
+@@ -1097,15 +1102,26 @@ again:
+ 				    details->check_mapping != page->mapping)
+ 					continue;
+ 			}
+-			ptent = ptep_get_and_clear_full(mm, addr, pte,
+-							tlb->fullmm);
+-			tlb_remove_tlb_entry(tlb, pte, addr);
++			ptent = eptep_get_and_clear_full(mm, addr, pte,
++					tlb->fullmm, &eptent);
++			if (!tlb->fullmm) {
++				smp_mb__after_atomic();
++				need_flush = pte_need_flush(mm, ptent, eptent,
++							    &cpu);
++			}
++
++			if (need_flush)
++				tlb_remove_tlb_entry(tlb, pte, addr, cpu);
++
++			ptent = pte_mk_unshadowed(ptent, eptent);
++
+ 			if (unlikely(!page))
+ 				continue;
+ 
+ 			if (!PageAnon(page)) {
+ 				if (pte_dirty(ptent)) {
+-					force_flush = 1;
++					if (need_flush)
++						force_flush = 1;
+ 					set_page_dirty(page);
+ 				}
+ 				if (pte_young(ptent) &&
+@@ -1116,7 +1132,9 @@ again:
+ 			page_remove_rmap(page, false);
+ 			if (unlikely(page_mapcount(page) < 0))
+ 				print_bad_pte(vma, addr, ptent, page);
+-			if (unlikely(!__tlb_remove_page(tlb, page))) {
++			if (!need_flush)
++				free_page_and_swap_cache(page);
++			else if (unlikely(!__tlb_remove_page(tlb, page))) {
+ 				force_flush = 1;
+ 				addr += PAGE_SIZE;
+ 				break;
+@@ -1138,7 +1156,7 @@ again:
+ 		}
+ 		if (unlikely(!free_swap_and_cache(entry)))
+ 			print_bad_pte(vma, addr, ptent, NULL);
+-		pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
++		epte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 
+ 	add_mm_rss_vec(mm, rss);
+@@ -1446,7 +1464,7 @@ static int insert_page(struct vm_area_struct *vma, unsigned long addr,
+ 	get_page(page);
+ 	inc_mm_counter_fast(mm, mm_counter_file(page));
+ 	page_add_file_rmap(page);
+-	set_pte_at(mm, addr, pte, mk_pte(page, prot));
++	set_epte_at(mm, addr, pte, mk_pte(page, prot), ZERO_EPTE(0));
+ 
+ 	retval = 0;
+ 	pte_unmap_unlock(pte, ptl);
+@@ -1521,7 +1539,7 @@ static int insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ 		entry = pte_mkdevmap(pfn_t_pte(pfn, prot));
+ 	else
+ 		entry = pte_mkspecial(pfn_t_pte(pfn, prot));
+-	set_pte_at(mm, addr, pte, entry);
++	set_epte_at(mm, addr, pte, entry, ZERO_EPTE(0));
+ 	update_mmu_cache(vma, addr, pte); /* XXX: why not for insert_page? */
+ 
+ 	retval = 0;
+@@ -1624,7 +1642,8 @@ static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
+ 	arch_enter_lazy_mmu_mode();
+ 	do {
+ 		BUG_ON(!pte_none(*pte));
+-		set_pte_at(mm, addr, pte, pte_mkspecial(pfn_pte(pfn, prot)));
++		set_epte_at(mm, addr, pte, pte_mkspecial(pfn_pte(pfn, prot)),
++			   ZERO_EPTE(0));
+ 		pfn++;
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 	arch_leave_lazy_mmu_mode();
+@@ -1955,6 +1974,43 @@ static gfp_t __get_fault_gfp_mask(struct vm_area_struct *vma)
+ 	return GFP_KERNEL;
+ }
+ 
++static inline int vma_can_push_to_tlb(struct vm_area_struct *vma)
++{
++	return !(vma->vm_flags & (VM_LOCKED | VM_EXEC | VM_IO | VM_HUGETLB |
++				VM_HUGEPAGE | VM_PFNMAP));
++}
++
++static int set_pte_at_tlb(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep,
++		    pte_t ptent, bool uncached)
++{
++	epte_t epte = ZERO_EPTE(0);
++	epte_t *eptep = get_eptep(ptep);
++	int r = 0;
++
++	/* can make decisions based on previous epte */
++	if (!eptep || !vma_can_push_to_tlb(vma) ||
++	    !arch_can_push_to_tlb(ptent))
++		goto finish;
++
++	if (uncached) {
++		ptent = epte_mk_uncached(ptent, &epte);
++	} else {
++		pte_t oldpte = *ptep;
++
++		epte = *eptep;
++		ptent = epte_mk_reset(vma->vm_mm, ptent, &epte, oldpte, false);
++	}
++
++	r = 1;
++finish:
++	/* XXX: Open coded, since we know it is fine */
++	set_pte_at(vma->vm_mm, addr, ptep, ptent);
++	if (eptep)
++		__set_epte(eptep, epte);
++
++	return r;
++}
++
+ /*
+  * Notify the address space that the page is about to become writable so that
+  * it can prohibit this or wait for the page to get into an appropriate state.
+@@ -2066,7 +2122,8 @@ static inline int wp_page_reuse(struct mm_struct *mm,
+  */
+ static int wp_page_copy(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			unsigned long address, pte_t *page_table, pmd_t *pmd,
+-			pte_t orig_pte, struct page *old_page)
++			pte_t orig_pte, struct page *old_page,
++			unsigned int flags, int *nr_ptes)
+ {
+ 	struct page *new_page = NULL;
+ 	spinlock_t *ptl = NULL;
+@@ -2129,7 +2186,9 @@ static int wp_page_copy(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		 * mmu page tables (such as kvm shadow page tables), we want the
+ 		 * new page to be mapped directly into the secondary page table.
+ 		 */
+-		set_pte_at_notify(mm, address, page_table, entry);
++		mmu_notifier_change_pte(mm, address, entry);
++		*nr_ptes = set_pte_at_tlb(vma, address, page_table, entry,
++					  true);
+ 		update_mmu_cache(vma, address, page_table);
+ 		if (old_page) {
+ 			/*
+@@ -2288,10 +2347,12 @@ static int wp_page_shared(struct mm_struct *mm, struct vm_area_struct *vma,
+  */
+ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pte_t *page_table, pmd_t *pmd,
+-		spinlock_t *ptl, pte_t orig_pte)
++		spinlock_t *ptl, pte_t orig_pte, unsigned int flags,
++		int *nr_ptes)
+ 	__releases(ptl)
+ {
+ 	struct page *old_page;
++	*nr_ptes = 1;
+ 
+ 	old_page = vm_normal_page(vma, address, orig_pte);
+ 	if (!old_page) {
+@@ -2309,7 +2370,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 		pte_unmap_unlock(page_table, ptl);
+ 		return wp_page_copy(mm, vma, address, page_table, pmd,
+-				    orig_pte, old_page);
++				    orig_pte, old_page, flags, nr_ptes);
+ 	}
+ 
+ 	/*
+@@ -2356,7 +2417,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 	pte_unmap_unlock(page_table, ptl);
+ 	return wp_page_copy(mm, vma, address, page_table, pmd,
+-			    orig_pte, old_page);
++			    orig_pte, old_page, flags, nr_ptes);
+ }
+ 
+ static void unmap_mapping_range_vma(struct vm_area_struct *vma,
+@@ -2449,7 +2510,7 @@ EXPORT_SYMBOL(unmap_mapping_range);
+  */
+ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pte_t *page_table, pmd_t *pmd,
+-		unsigned int flags, pte_t orig_pte)
++		unsigned int flags, pte_t orig_pte, int *nr_ptes)
+ {
+ 	spinlock_t *ptl;
+ 	struct page *page, *swapcache;
+@@ -2571,7 +2632,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	flush_icache_page(vma, page);
+ 	if (pte_swp_soft_dirty(orig_pte))
+ 		pte = pte_mksoft_dirty(pte);
+-	set_pte_at(mm, address, page_table, pte);
++	*nr_ptes = set_pte_at_tlb(vma, address, page_table, pte, true);
++
+ 	if (page == swapcache) {
+ 		do_page_add_anon_rmap(page, vma, address, exclusive);
+ 		mem_cgroup_commit_charge(page, memcg, true, false);
+@@ -2600,7 +2662,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	}
+ 
+ 	if (flags & FAULT_FLAG_WRITE) {
+-		ret |= do_wp_page(mm, vma, address, page_table, pmd, ptl, pte);
++		ret |= do_wp_page(mm, vma, address, page_table, pmd, ptl, pte,
++				  flags, nr_ptes);
+ 		if (ret & VM_FAULT_ERROR)
+ 			ret &= VM_FAULT_ERROR;
+ 		goto out;
+@@ -2667,7 +2730,7 @@ static inline int check_stack_guard_page(struct vm_area_struct *vma, unsigned lo
+  */
+ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pte_t *page_table, pmd_t *pmd,
+-		unsigned int flags)
++		unsigned int flags, int *nr_ptes)
+ {
+ 	struct mem_cgroup *memcg;
+ 	struct page *page;
+@@ -2739,7 +2802,7 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	mem_cgroup_commit_charge(page, memcg, false, false);
+ 	lru_cache_add_active_or_unevictable(page, vma);
+ setpte:
+-	set_pte_at(mm, address, page_table, entry);
++	*nr_ptes = set_pte_at_tlb(vma, address, page_table, entry, true);
+ 
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache(vma, address, page_table);
+@@ -2813,10 +2876,12 @@ static int __do_fault(struct vm_area_struct *vma, unsigned long address,
+  * Target users are page handler itself and implementations of
+  * vm_ops->map_pages.
+  */
+-void do_set_pte(struct vm_area_struct *vma, unsigned long address,
+-		struct page *page, pte_t *pte, bool write, bool anon)
++int do_set_pte(struct vm_area_struct *vma, unsigned long address,
++		struct page *page, pte_t *pte, bool write, bool anon,
++		unsigned int flags)
+ {
+ 	pte_t entry;
++	int r;
+ 
+ 	flush_icache_page(vma, page);
+ 	entry = mk_pte(page, vma->vm_page_prot);
+@@ -2829,10 +2894,11 @@ void do_set_pte(struct vm_area_struct *vma, unsigned long address,
+ 		inc_mm_counter_fast(vma->vm_mm, mm_counter_file(page));
+ 		page_add_file_rmap(page);
+ 	}
+-	set_pte_at(vma->vm_mm, address, pte, entry);
++	r = set_pte_at_tlb(vma, address, pte, entry, true);
+ 
+ 	/* no need to invalidate: a not-present page won't be cached */
+ 	update_mmu_cache(vma, address, pte);
++	return r;
+ }
+ 
+ static unsigned long fault_around_bytes __read_mostly =
+@@ -2899,13 +2965,14 @@ late_initcall(fault_around_debugfs);
+  * fault_around_pages() value (and therefore to page order).  This way it's
+  * easier to guarantee that we don't cross page table boundaries.
+  */
+-static void do_fault_around(struct vm_area_struct *vma, unsigned long address,
++static int do_fault_around(struct vm_area_struct *vma, unsigned long *paddress,
+ 		pte_t *pte, pgoff_t pgoff, unsigned int flags)
+ {
+ 	unsigned long start_addr, nr_pages, mask;
+ 	pgoff_t max_pgoff;
+ 	struct vm_fault vmf;
+ 	int off;
++	unsigned long address = *paddress;
+ 
+ 	nr_pages = READ_ONCE(fault_around_bytes) >> PAGE_SHIFT;
+ 	mask = ~(nr_pages * PAGE_SIZE - 1) & PAGE_MASK;
+@@ -2927,13 +2994,14 @@ static void do_fault_around(struct vm_area_struct *vma, unsigned long address,
+ 	/* Check if it makes any sense to call ->map_pages */
+ 	while (!pte_none(*pte)) {
+ 		if (++pgoff > max_pgoff)
+-			return;
++			return 0;
+ 		start_addr += PAGE_SIZE;
+ 		if (start_addr >= vma->vm_end)
+-			return;
++			return 0;
+ 		pte++;
+ 	}
+ 
++	*paddress = start_addr;
+ 	vmf.virtual_address = (void __user *) start_addr;
+ 	vmf.pte = pte;
+ 	vmf.pgoff = pgoff;
+@@ -2941,16 +3009,20 @@ static void do_fault_around(struct vm_area_struct *vma, unsigned long address,
+ 	vmf.flags = flags;
+ 	vmf.gfp_mask = __get_fault_gfp_mask(vma);
+ 	vma->vm_ops->map_pages(vma, &vmf);
++	/* XXX: we should check if the page should be pushed before */
++	return max_pgoff - pgoff + 1;
+ }
+ 
+ static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-		unsigned long address, pmd_t *pmd,
+-		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
++		unsigned long *paddress, pmd_t *pmd,
++		pgoff_t pgoff, unsigned int flags, pte_t orig_pte,
++		int *nr_ptes)
+ {
+ 	struct page *fault_page;
+ 	spinlock_t *ptl;
+ 	pte_t *pte;
+-	int ret = 0;
++	int r, ret = 0;
++	unsigned long address = *paddress;
+ 
+ 	/*
+ 	 * Let's call ->map_pages() first and use ->fault() as fallback
+@@ -2959,7 +3031,7 @@ static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	 */
+ 	if (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1) {
+ 		pte = pte_offset_map_lock(mm, pmd, address, &ptl);
+-		do_fault_around(vma, address, pte, pgoff, flags);
++		*nr_ptes = do_fault_around(vma, paddress, pte, pgoff, flags);
+ 		if (!pte_same(*pte, orig_pte))
+ 			goto unlock_out;
+ 		pte_unmap_unlock(pte, ptl);
+@@ -2976,7 +3048,10 @@ static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		page_cache_release(fault_page);
+ 		return ret;
+ 	}
+-	do_set_pte(vma, address, fault_page, pte, false, false);
++
++	r = do_set_pte(vma, address, fault_page, pte, false, false, flags);
++	if (r && *nr_ptes == 0)
++		*nr_ptes = 1;
+ 	unlock_page(fault_page);
+ unlock_out:
+ 	pte_unmap_unlock(pte, ptl);
+@@ -2985,7 +3060,8 @@ unlock_out:
+ 
+ static int do_cow_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pmd_t *pmd,
+-		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
++		pgoff_t pgoff, unsigned int flags, pte_t orig_pte,
++		int *nr_ptes)
+ {
+ 	struct page *fault_page, *new_page;
+ 	struct mem_cgroup *memcg;
+@@ -3028,7 +3104,7 @@ static int do_cow_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		}
+ 		goto uncharge_out;
+ 	}
+-	do_set_pte(vma, address, new_page, pte, true, true);
++	*nr_ptes = do_set_pte(vma, address, new_page, pte, true, true, flags);
+ 	mem_cgroup_commit_charge(new_page, memcg, false, false);
+ 	lru_cache_add_active_or_unevictable(new_page, vma);
+ 	pte_unmap_unlock(pte, ptl);
+@@ -3051,7 +3127,8 @@ uncharge_out:
+ 
+ static int do_shared_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pmd_t *pmd,
+-		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
++		pgoff_t pgoff, unsigned int flags, pte_t orig_pte,
++		int *nr_ptes)
+ {
+ 	struct page *fault_page;
+ 	struct address_space *mapping;
+@@ -3085,7 +3162,8 @@ static int do_shared_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		page_cache_release(fault_page);
+ 		return ret;
+ 	}
+-	do_set_pte(vma, address, fault_page, pte, true, false);
++	*nr_ptes = do_set_pte(vma, address, fault_page, pte, true, false,
++			      flags);
+ 	pte_unmap_unlock(pte, ptl);
+ 
+ 	if (set_page_dirty(fault_page))
+@@ -3119,9 +3197,11 @@ static int do_shared_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ static int do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-		unsigned long address, pte_t *page_table, pmd_t *pmd,
+-		unsigned int flags, pte_t orig_pte)
++		unsigned long *paddress, pte_t *page_table, pmd_t *pmd,
++		unsigned int flags, pte_t orig_pte,
++		int *nr_ptes)
+ {
++	unsigned long address = *paddress;
+ 	pgoff_t pgoff = (((address & PAGE_MASK)
+ 			- vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+ 
+@@ -3130,12 +3210,13 @@ static int do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (!vma->vm_ops->fault)
+ 		return VM_FAULT_SIGBUS;
+ 	if (!(flags & FAULT_FLAG_WRITE))
+-		return do_read_fault(mm, vma, address, pmd, pgoff, flags,
+-				orig_pte);
++		return do_read_fault(mm, vma, paddress, pmd, pgoff, flags,
++				orig_pte, nr_ptes);
+ 	if (!(vma->vm_flags & VM_SHARED))
+ 		return do_cow_fault(mm, vma, address, pmd, pgoff, flags,
+-				orig_pte);
+-	return do_shared_fault(mm, vma, address, pmd, pgoff, flags, orig_pte);
++				orig_pte, nr_ptes);
++	return do_shared_fault(mm, vma, address, pmd, pgoff, flags, orig_pte,
++			nr_ptes);
+ }
+ 
+ static int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
+@@ -3154,7 +3235,8 @@ static int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
+ }
+ 
+ static int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+-		   unsigned long addr, pte_t pte, pte_t *ptep, pmd_t *pmd)
++		   unsigned long addr, pte_t pte, pte_t *ptep, pmd_t *pmd,
++		   unsigned int fault_flags, int *nr_ptes)
+ {
+ 	struct page *page = NULL;
+ 	spinlock_t *ptl;
+@@ -3164,6 +3246,9 @@ static int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	bool migrated = false;
+ 	bool was_writable = pte_write(pte);
+ 	int flags = 0;
++	epte_t epte;
++	int flush_cpu;
++	bool need_flush = true;
+ 
+ 	/* A PROT_NONE fault should not end up here */
+ 	BUG_ON(!(vma->vm_flags & (VM_READ | VM_EXEC | VM_WRITE)));
+@@ -3184,12 +3269,19 @@ static int do_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		goto out;
+ 	}
+ 
++	/* Check if it is uncached */
++	epte = get_epte(ptep);
++	need_flush = mm_tlb_flush_pending(mm) &&
++		pte_need_flush(mm, pte, epte, &flush_cpu);
++
+ 	/* Make it present again */
+ 	pte = pte_modify(pte, vma->vm_page_prot);
+ 	pte = pte_mkyoung(pte);
+ 	if (was_writable)
+ 		pte = pte_mkwrite(pte);
+-	set_pte_at(mm, addr, ptep, pte);
++
++	*nr_ptes = set_pte_at_tlb(vma, addr, ptep, pte, !need_flush);
++
+ 	update_mmu_cache(vma, addr, ptep);
+ 
+ 	page = vm_normal_page(vma, addr, pte);
+@@ -3283,11 +3375,14 @@ static int wp_huge_pmd(struct mm_struct *mm, struct vm_area_struct *vma,
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ static int handle_pte_fault(struct mm_struct *mm,
+-		     struct vm_area_struct *vma, unsigned long address,
+-		     pte_t *pte, pmd_t *pmd, unsigned int flags)
++		     struct vm_area_struct *vma, unsigned long *paddress,
++		     pte_t *pte, pmd_t *pmd, unsigned int flags,
++		     int *nr_ptes)
+ {
+ 	pte_t entry;
+ 	spinlock_t *ptl;
++	unsigned long address = *paddress;
++	*nr_ptes = 0;
+ 
+ 	/*
+ 	 * some architectures can have larger ptes than wordsize,
+@@ -3303,26 +3398,30 @@ static int handle_pte_fault(struct mm_struct *mm,
+ 		if (pte_none(entry)) {
+ 			if (vma_is_anonymous(vma))
+ 				return do_anonymous_page(mm, vma, address,
+-							 pte, pmd, flags);
++							 pte, pmd, flags,
++							 nr_ptes);
+ 			else
+-				return do_fault(mm, vma, address, pte, pmd,
+-						flags, entry);
++				return do_fault(mm, vma, paddress, pte, pmd,
++						flags, entry, nr_ptes);
+ 		}
+ 		return do_swap_page(mm, vma, address,
+-					pte, pmd, flags, entry);
++					pte, pmd, flags, entry, nr_ptes);
+ 	}
+ 
+-	if (pte_protnone(entry))
+-		return do_numa_page(mm, vma, address, entry, pte, pmd);
++	if (pte_protnone(entry)) {
++		return do_numa_page(mm, vma, address, entry, pte, pmd, flags,
++				nr_ptes);
++	}
+ 
+ 	ptl = pte_lockptr(mm, pmd);
+ 	spin_lock(ptl);
+ 	if (unlikely(!pte_same(*pte, entry)))
+ 		goto unlock;
+ 	if (flags & FAULT_FLAG_WRITE) {
+-		if (!pte_write(entry))
++		if (!pte_write(entry)) {
+ 			return do_wp_page(mm, vma, address,
+-					pte, pmd, ptl, entry);
++					pte, pmd, ptl, entry, flags, nr_ptes);
++		}
+ 		entry = pte_mkdirty(entry);
+ 	}
+ 	entry = pte_mkyoung(entry);
+@@ -3350,12 +3449,14 @@ unlock:
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-			     unsigned long address, unsigned int flags)
++			     unsigned long *paddress, unsigned int flags,
++			     int *nr_ptes)
+ {
+ 	pgd_t *pgd;
+ 	pud_t *pud;
+ 	pmd_t *pmd;
+ 	pte_t *pte;
++	unsigned long address = *paddress;
+ 
+ 	if (unlikely(is_vm_hugetlb_page(vma)))
+ 		return hugetlb_fault(mm, vma, address, flags);
+@@ -3425,7 +3526,7 @@ static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	 */
+ 	pte = pte_offset_map(pmd, address);
+ 
+-	return handle_pte_fault(mm, vma, address, pte, pmd, flags);
++	return handle_pte_fault(mm, vma, paddress, pte, pmd, flags, nr_ptes);
+ }
+ 
+ /*
+@@ -3434,8 +3535,9 @@ static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+  * The mmap_sem may have been released depending on flags and our
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+-int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-		    unsigned long address, unsigned int flags)
++int _handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		    unsigned long *paddress, unsigned int flags,
++		    int *nr_ptes)
+ {
+ 	int ret;
+ 
+@@ -3454,7 +3556,7 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (flags & FAULT_FLAG_USER)
+ 		mem_cgroup_oom_enable();
+ 
+-	ret = __handle_mm_fault(mm, vma, address, flags);
++	ret = __handle_mm_fault(mm, vma, paddress, flags, nr_ptes);
+ 
+ 	if (flags & FAULT_FLAG_USER) {
+ 		mem_cgroup_oom_disable();
+@@ -3470,6 +3572,15 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(_handle_mm_fault);
++
++int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		    unsigned long address, unsigned int flags)
++{
++	int nr_ptes;
++
++	return _handle_mm_fault(mm, vma, &address, flags, &nr_ptes);
++}
+ EXPORT_SYMBOL_GPL(handle_mm_fault);
+ 
+ #ifndef __PAGETABLE_PUD_FOLDED
+@@ -3912,3 +4023,42 @@ void ptlock_free(struct page *page)
+ 	kmem_cache_free(page_ptl_cachep, page->ptl);
+ }
+ #endif
++
++void lockless_push_to_tlb(struct mm_struct *mm, unsigned long addr,
++			  int nr_ptes)
++{
++	pmd_t *pmd;
++
++	if (nr_ptes == 0)
++		return;
++
++	pmd = mm_find_pmd(mm, addr);
++	if (unlikely(!pmd))
++		return;
++
++	arch_push_to_tlb(mm, addr, pmd, nr_ptes);
++}
++
++struct kmem_cache *tlb_info_cachep;
++struct kmem_cache *mmu_gather_cachep;
++
++int init_sw_tlb(bool primary)
++{
++	int r = -EINVAL;
++
++	if (arch_init_sw_tlb(primary))
++		goto out;
++	if (primary) {
++		tlb_info_cachep = KMEM_CACHE(flush_tlb_info_multi, SLAB_PANIC);
++		mmu_gather_cachep = KMEM_CACHE(mmu_gather, SLAB_PANIC);
++	}
++
++	r = 0;
++out:
++	return r;
++}
++
++void deinit_sw_tlb(void)
++{
++}
++
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 9a3f6b9..856735e 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -518,8 +518,30 @@ static int queue_pages_pte_range(pmd_t *pmd, unsigned long addr,
+ retry:
+ 	pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+ 	for (; addr != end; pte++, addr += PAGE_SIZE) {
++		epte_t *eptep;
++
+ 		if (!pte_present(*pte))
+ 			continue;
++
++		/*
++		 * While at it, remove the young bit, update the generation,
++		 * etc.
++		 */
++		if (pte_young(*pte) && (eptep = get_eptep(pte)) != NULL) {
++			epte_t epte = *eptep;
++
++			if (test_and_clear_bit(_PAGE_BIT_ACCESSED,
++						(unsigned long *)&pte->pte)) {
++				smp_mb__after_atomic();
++				pte_update(walk->mm, addr, pte);
++				epte.cpu_plus_one = 0;
++				epte.sw_young = 1;
++				epte.generation =
++					atomic_read(&walk->mm->flush_cnt);
++				__set_epte(eptep, epte);
++			}
++		}
++
+ 		page = vm_normal_page(vma, addr, *pte);
+ 		if (!page)
+ 			continue;
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 3ad0fea..3e52b20 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -111,6 +111,7 @@ static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
+  	pmd_t *pmd;
+ 	pte_t *ptep, pte;
+  	spinlock_t *ptl;
++	epte_t epte = ZERO_EPTE(0);
+ 
+ 	if (unlikely(PageHuge(new))) {
+ 		ptep = huge_pte_offset(mm, addr);
+@@ -159,7 +160,8 @@ static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
+ 	}
+ #endif
+ 	flush_dcache_page(new);
+-	set_pte_at(mm, addr, ptep, pte);
++	pte = epte_mk_uncached(pte, &epte);
++	set_epte_at(mm, addr, ptep, pte, epte);
+ 
+ 	if (PageHuge(new)) {
+ 		if (PageAnon(new))
+@@ -888,7 +890,8 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !anon_vma,
+ 				page);
+ 		try_to_unmap(page,
+-			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
++			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS,
++			NULL);
+ 		page_was_mapped = 1;
+ 	}
+ 
+@@ -1056,7 +1059,8 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 
+ 	if (page_mapped(hpage)) {
+ 		try_to_unmap(hpage,
+-			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
++			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS,
++			NULL);
+ 		page_was_mapped = 1;
+ 	}
+ 
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 76d1ec2..1c80227 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2614,7 +2614,6 @@ int vm_munmap(unsigned long start, size_t len)
+ {
+ 	int ret;
+ 	struct mm_struct *mm = current->mm;
+-
+ 	down_write(&mm->mmap_sem);
+ 	ret = do_munmap(mm, start, len);
+ 	up_write(&mm->mmap_sem);
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index f7cb3d4..d48cce2 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -27,6 +27,7 @@
+ #include <asm/uaccess.h>
+ #include <asm/pgtable.h>
+ #include <asm/cacheflush.h>
++#include <asm/tlb.h>
+ #include <asm/tlbflush.h>
+ 
+ #include "internal.h"
+@@ -61,7 +62,7 @@ static pte_t *lock_pte_protection(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long addr, unsigned long end, pgprot_t newprot,
+-		int dirty_accountable, int prot_numa)
++		int dirty_accountable, int prot_numa, struct mmu_gather *tlb)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *pte, oldpte;
+@@ -77,7 +78,9 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 		oldpte = *pte;
+ 		if (pte_present(oldpte)) {
+ 			pte_t ptent;
++			epte_t eptent;
+ 			bool preserve_write = prot_numa && pte_write(oldpte);
++			int cpu = -1;
+ 
+ 			/*
+ 			 * Avoid trapping faults against the zero or KSM
+@@ -95,7 +98,10 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 					continue;
+ 			}
+ 
+-			ptent = ptep_modify_prot_start(mm, addr, pte);
++			ptent = eptep_modify_prot_start(mm, addr, pte, &eptent);
++			smp_mb__after_atomic();
++
++			oldpte = ptent;
+ 			ptent = pte_modify(ptent, newprot);
+ 			if (preserve_write)
+ 				ptent = pte_mkwrite(ptent);
+@@ -106,8 +112,25 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 					 !(vma->vm_flags & VM_SOFTDIRTY))) {
+ 				ptent = pte_mkwrite(ptent);
+ 			}
+-			ptep_modify_prot_commit(mm, addr, pte, ptent);
+-			pages++;
++
++			if (pte_need_flush(mm, oldpte, eptent, &cpu)) {
++				tlb_remove_tlb_entry(tlb, pte, addr, cpu);
++				pages++;
++				/*
++				 * The pte is about to be flushed, yet present.
++				 */
++				ptent = epte_mk_reset(mm, ptent, &eptent,
++						      oldpte, true);
++			} else {
++				/* no need to flush, mark as uncached */
++				ptent = epte_mk_uncached(ptent, &eptent);
++			}
++
++			/*
++			 * This one is tricky: we still did not flush, so we
++			 * cannot use the uncached generation
++			 */
++			eptep_modify_prot_commit(mm, addr, pte, ptent, eptent);
+ 		} else if (IS_ENABLED(CONFIG_MIGRATION)) {
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
+ 
+@@ -121,7 +144,8 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 				newpte = swp_entry_to_pte(entry);
+ 				if (pte_swp_soft_dirty(oldpte))
+ 					newpte = pte_swp_mksoft_dirty(newpte);
+-				set_pte_at(mm, addr, pte, newpte);
++				set_epte_at(mm, addr, pte, newpte,
++					    ZERO_EPTE(0));
+ 
+ 				pages++;
+ 			}
+@@ -135,7 +159,8 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 		pud_t *pud, unsigned long addr, unsigned long end,
+-		pgprot_t newprot, int dirty_accountable, int prot_numa)
++		pgprot_t newprot, int dirty_accountable, int prot_numa,
++		struct mmu_gather *tlb)
+ {
+ 	pmd_t *pmd;
+ 	struct mm_struct *mm = vma->vm_mm;
+@@ -181,7 +206,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 			/* fall through, the trans huge pmd just split */
+ 		}
+ 		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
+-				 dirty_accountable, prot_numa);
++				 dirty_accountable, prot_numa, tlb);
+ 		pages += this_pages;
+ 	} while (pmd++, addr = next, addr != end);
+ 
+@@ -195,7 +220,8 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
+ 
+ static inline unsigned long change_pud_range(struct vm_area_struct *vma,
+ 		pgd_t *pgd, unsigned long addr, unsigned long end,
+-		pgprot_t newprot, int dirty_accountable, int prot_numa)
++		pgprot_t newprot, int dirty_accountable, int prot_numa,
++		struct mmu_gather *tlb)
+ {
+ 	pud_t *pud;
+ 	unsigned long next;
+@@ -207,7 +233,7 @@ static inline unsigned long change_pud_range(struct vm_area_struct *vma,
+ 		if (pud_none_or_clear_bad(pud))
+ 			continue;
+ 		pages += change_pmd_range(vma, pud, addr, next, newprot,
+-				 dirty_accountable, prot_numa);
++				 dirty_accountable, prot_numa, tlb);
+ 	} while (pud++, addr = next, addr != end);
+ 
+ 	return pages;
+@@ -220,24 +246,25 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgd_t *pgd;
+ 	unsigned long next;
+-	unsigned long start = addr;
+ 	unsigned long pages = 0;
++	struct mmu_gather tlb;
+ 
+ 	BUG_ON(addr >= end);
+ 	pgd = pgd_offset(mm, addr);
+ 	flush_cache_range(vma, addr, end);
++	tlb_gather_mmu(&tlb, mm, addr, end);
+ 	set_tlb_flush_pending(mm);
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+ 		if (pgd_none_or_clear_bad(pgd))
+ 			continue;
+ 		pages += change_pud_range(vma, pgd, addr, next, newprot,
+-				 dirty_accountable, prot_numa);
++				 dirty_accountable, prot_numa, &tlb);
+ 	} while (pgd++, addr = next, addr != end);
+ 
+ 	/* Only flush the TLB if we actually modified any entries: */
+ 	if (pages)
+-		flush_tlb_range(vma, start, end);
++		tlb_flush_mmu(&tlb);
+ 	clear_tlb_flush_pending(mm);
+ 
+ 	return pages;
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 8eeba02..c108e15 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -139,12 +139,17 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+ 
+ 	for (; old_addr < old_end; old_pte++, old_addr += PAGE_SIZE,
+ 				   new_pte++, new_addr += PAGE_SIZE) {
++		epte_t epte;
+ 		if (pte_none(*old_pte))
+ 			continue;
+-		pte = ptep_get_and_clear(mm, old_addr, old_pte);
++		pte = eptep_get_and_clear(mm, old_addr, old_pte, &epte);
+ 		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
++		if (pte_present(pte))
++			pte = epte_mk_uncached(pte, &epte);
++		else
++			epte = ZERO_EPTE(0);
+ 		pte = move_soft_dirty_pte(pte);
+-		set_pte_at(mm, new_addr, new_pte, pte);
++		set_epte_at(mm, new_addr, new_pte, pte, epte);
+ 	}
+ 
+ 	arch_leave_lazy_mmu_mode();
+diff --git a/mm/pgtable-generic.c b/mm/pgtable-generic.c
+index 06a005b..62fb566 100644
+--- a/mm/pgtable-generic.c
++++ b/mm/pgtable-generic.c
+@@ -70,16 +70,39 @@ int ptep_clear_flush_young(struct vm_area_struct *vma,
+ #endif
+ 
+ #ifndef __HAVE_ARCH_PTEP_CLEAR_FLUSH
+-pte_t ptep_clear_flush(struct vm_area_struct *vma, unsigned long address,
+-		       pte_t *ptep)
++pte_t eptep_clear_flush(struct vm_area_struct *vma, unsigned long address,
++			pte_t *ptep, epte_t *epte)
+ {
+ 	struct mm_struct *mm = (vma)->vm_mm;
+ 	pte_t pte;
+-	pte = ptep_get_and_clear(mm, address, ptep);
+-	if (pte_accessible(mm, pte))
+-		flush_tlb_page(vma, address);
++
++	pte = eptep_get_and_clear(mm, address, ptep, epte);
++
++	if (pte_accessible(mm, pte)) {
++		int cpu = -1;
++		bool need_flush;
++
++		smp_mb__after_atomic();
++		need_flush = pte_need_flush(mm, pte, *epte, &cpu);
++
++		if (need_flush) {
++			if (cpu >= 0)
++				flush_tlb_page_cpu(vma, address, cpu);
++			else
++				flush_tlb_page(vma, address);
++		}
++	}
++
+ 	return pte;
+ }
++
++pte_t ptep_clear_flush(struct vm_area_struct *vma, unsigned long address,
++		       pte_t *ptep)
++{
++	epte_t epte;
++
++	return eptep_clear_flush(vma, address, ptep, &epte);
++}
+ #endif
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 79f3bf0..34ebbb1 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -62,6 +62,7 @@
+ #include <linux/backing-dev.h>
+ #include <linux/page_idle.h>
+ 
++#include <asm/tlb.h>
+ #include <asm/tlbflush.h>
+ 
+ #include <trace/events/tlb.h>
+@@ -569,65 +570,36 @@ void page_unlock_anon_vma_read(struct anon_vma *anon_vma)
+ }
+ 
+ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+-static void percpu_flush_tlb_batch_pages(void *data)
+-{
+-	/*
+-	 * All TLB entries are flushed on the assumption that it is
+-	 * cheaper to flush all TLBs and let them be refilled than
+-	 * flushing individual PFNs. Note that we do not track mm's
+-	 * to flush as that might simply be multiple full TLB flushes
+-	 * for no gain.
+-	 */
+-	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+-	flush_tlb_local();
+-}
+-
+ /*
+  * Flush TLB entries for recently unmapped pages from remote CPUs. It is
+  * important if a PTE was dirty when it was unmapped that it's flushed
+  * before any IO is initiated on the page to prevent lost writes. Similarly,
+  * it must be flushed before freeing to prevent data leakage.
+  */
+-void try_to_unmap_flush(void)
++void try_to_unmap_flush(struct tlbflush_unmap_batch *tlb_ubc)
+ {
+-	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+-	int cpu;
+-
+ 	if (!tlb_ubc->flush_required)
+ 		return;
+ 
+-	cpu = get_cpu();
+-
+-	trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, -1UL);
+-
+-	if (cpumask_test_cpu(cpu, &tlb_ubc->cpumask))
+-		percpu_flush_tlb_batch_pages(&tlb_ubc->cpumask);
+-
+-	if (cpumask_any_but(&tlb_ubc->cpumask, cpu) < nr_cpu_ids) {
+-		smp_call_function_many(&tlb_ubc->cpumask,
+-			percpu_flush_tlb_batch_pages, (void *)tlb_ubc, true);
+-	}
+-	cpumask_clear(&tlb_ubc->cpumask);
++	flush_tlb_mm_entries(&tlb_ubc->flush_info.info);
+ 	tlb_ubc->flush_required = false;
+ 	tlb_ubc->writable = false;
+-	put_cpu();
++	__tlb_reset_flush_tlb_info(&tlb_ubc->flush_info.info, false);
+ }
+ 
+ /* Flush iff there are potentially writable TLB entries that can race with IO */
+-void try_to_unmap_flush_dirty(void)
++void try_to_unmap_flush_dirty(struct tlbflush_unmap_batch *tlb_ubc)
+ {
+-	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+-
+ 	if (tlb_ubc->writable)
+-		try_to_unmap_flush();
++		try_to_unmap_flush(tlb_ubc);
+ }
+ 
+ static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
+-		struct page *page, bool writable)
++		unsigned long address, bool writable,
++		struct tlbflush_unmap_batch *tlb_ubc, int cpu)
+ {
+-	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
++	struct flush_tlb_info *info = &tlb_ubc->flush_info.info;
+ 
+-	cpumask_or(&tlb_ubc->cpumask, &tlb_ubc->cpumask, mm_cpumask(mm));
+ 	tlb_ubc->flush_required = true;
+ 
+ 	/*
+@@ -637,6 +609,8 @@ static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
+ 	 */
+ 	if (writable)
+ 		tlb_ubc->writable = true;
++
++	tlb_add_flush_range(info, mm, address, cpu);
+ }
+ 
+ /*
+@@ -659,7 +633,9 @@ static bool should_defer_flush(struct mm_struct *mm, enum ttu_flags flags)
+ }
+ #else
+ static void set_tlb_ubc_flush_pending(struct mm_struct *mm,
+-		struct page *page, bool writable)
++		unsigned long address, bool writable,
++		struct tlbflush_unmap_batch *tlb_ubc,
++		int cpu)
+ {
+ }
+ 
+@@ -1032,6 +1008,7 @@ static int page_mkclean_one(struct page *page, struct vm_area_struct *vma,
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *pte;
++	epte_t epte;
+ 	spinlock_t *ptl;
+ 	int ret = 0;
+ 	int *cleaned = arg;
+@@ -1044,10 +1021,13 @@ static int page_mkclean_one(struct page *page, struct vm_area_struct *vma,
+ 		pte_t entry;
+ 
+ 		flush_cache_page(vma, address, pte_pfn(*pte));
+-		entry = ptep_clear_flush(vma, address, pte);
++		entry = eptep_clear_flush(vma, address, pte, &epte);
+ 		entry = pte_wrprotect(entry);
+ 		entry = pte_mkclean(entry);
+-		set_pte_at(mm, address, pte, entry);
++		entry = epte_mk_uncached(entry, &epte);
++
++		set_epte_at(mm, address, pte, entry, epte);
++
+ 		ret = 1;
+ 	}
+ 
+@@ -1415,6 +1395,7 @@ void page_remove_rmap(struct page *page, bool compound)
+ struct rmap_private {
+ 	enum ttu_flags flags;
+ 	int lazyfreed;
++	struct tlbflush_unmap_batch *tlb_ubc;
+ };
+ 
+ /*
+@@ -1430,6 +1411,8 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 	int ret = SWAP_AGAIN;
+ 	struct rmap_private *rp = arg;
+ 	enum ttu_flags flags = rp->flags;
++	struct tlbflush_unmap_batch *tlb_ubc = rp->tlb_ubc;
++	epte_t epte;
+ 
+ 	/* munlock has nothing to gain from examining un-locked vmas */
+ 	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
+@@ -1464,6 +1447,9 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 	/* Nuke the page table entry. */
+ 	flush_cache_page(vma, address, page_to_pfn(page));
+ 	if (should_defer_flush(mm, flags)) {
++		int cpu = -1;
++
++
+ 		/*
+ 		 * We clear the PTE but do not flush so potentially a remote
+ 		 * CPU could still be writing to the page. If the entry was
+@@ -1471,11 +1457,17 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		 * a clear->dirty transition on a cached TLB entry is written
+ 		 * through and traps if the PTE is unmapped.
+ 		 */
+-		pteval = ptep_get_and_clear(mm, address, pte);
+ 
+-		set_tlb_ubc_flush_pending(mm, page, pte_dirty(pteval));
++		pteval = eptep_get_and_clear(mm, address, pte, &epte);
++
++		smp_mb__after_atomic();
++
++		if (pte_need_flush(mm, pteval, epte, &cpu))
++			set_tlb_ubc_flush_pending(mm, address,
++						  pte_dirty(pteval),
++						  tlb_ubc, cpu);
+ 	} else {
+-		pteval = ptep_clear_flush(vma, address, pte);
++		pteval = eptep_clear_flush(vma, address, pte, &epte);
+ 	}
+ 
+ 	/* Move the dirty bit to the physical page now the pte is gone. */
+@@ -1491,8 +1483,9 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		} else {
+ 			dec_mm_counter(mm, mm_counter(page));
+ 		}
+-		set_pte_at(mm, address, pte,
+-			   swp_entry_to_pte(make_hwpoison_entry(page)));
++		set_epte_at(mm, address, pte,
++			   swp_entry_to_pte(make_hwpoison_entry(page)),
++			   ZERO_EPTE(0));
+ 	} else if (pte_unused(pteval)) {
+ 		/*
+ 		 * The guest indicated that the page content is of no
+@@ -1512,7 +1505,7 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		swp_pte = swp_entry_to_pte(entry);
+ 		if (pte_soft_dirty(pteval))
+ 			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+-		set_pte_at(mm, address, pte, swp_pte);
++		set_epte_at(mm, address, pte, swp_pte, ZERO_EPTE(0));
+ 	} else if (PageAnon(page)) {
+ 		swp_entry_t entry = { .val = page_private(page) };
+ 		pte_t swp_pte;
+@@ -1530,7 +1523,7 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		}
+ 
+ 		if (swap_duplicate(entry) < 0) {
+-			set_pte_at(mm, address, pte, pteval);
++			set_epte_at(mm, address, pte, pteval, ZERO_EPTE(0));
+ 			ret = SWAP_FAIL;
+ 			goto out_unmap;
+ 		}
+@@ -1545,7 +1538,7 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		swp_pte = swp_entry_to_pte(entry);
+ 		if (pte_soft_dirty(pteval))
+ 			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+-		set_pte_at(mm, address, pte, swp_pte);
++		set_epte_at(mm, address, pte, swp_pte, ZERO_EPTE(0));
+ 	} else
+ 		dec_mm_counter(mm, mm_counter_file(page));
+ 
+@@ -1599,12 +1592,14 @@ static int page_not_mapped(struct page *page)
+  * SWAP_FAIL	- the page is unswappable
+  * SWAP_MLOCK	- page is mlocked.
+  */
+-int try_to_unmap(struct page *page, enum ttu_flags flags)
++int try_to_unmap(struct page *page, enum ttu_flags flags,
++		 struct tlbflush_unmap_batch *tlb_ubc)
+ {
+ 	int ret;
+ 	struct rmap_private rp = {
+ 		.flags = flags,
+ 		.lazyfreed = 0,
++		.tlb_ubc = tlb_ubc,
+ 	};
+ 
+ 	struct rmap_walk_control rwc = {
+diff --git a/mm/sparse-vmemmap.c b/mm/sparse-vmemmap.c
+index b60802b..7600c60 100644
+--- a/mm/sparse-vmemmap.c
++++ b/mm/sparse-vmemmap.c
+@@ -179,7 +179,7 @@ pte_t * __meminit vmemmap_pte_populate(pmd_t *pmd, unsigned long addr, int node)
+ 		if (!p)
+ 			return NULL;
+ 		entry = pfn_pte(__pa(p) >> PAGE_SHIFT, PAGE_KERNEL);
+-		set_pte_at(&init_mm, addr, pte, entry);
++		set_epte_at(&init_mm, addr, pte, entry, ZERO_EPTE(0));
+ 	}
+ 	return pte;
+ }
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index d2c3736..589e811 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1149,8 +1149,8 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
+ 	dec_mm_counter(vma->vm_mm, MM_SWAPENTS);
+ 	inc_mm_counter(vma->vm_mm, MM_ANONPAGES);
+ 	get_page(page);
+-	set_pte_at(vma->vm_mm, addr, pte,
+-		   pte_mkold(mk_pte(page, vma->vm_page_prot)));
++	set_epte_at(vma->vm_mm, addr, pte,
++		   pte_mkold(mk_pte(page, vma->vm_page_prot)), ZERO_EPTE(0));
+ 	if (page == swapcache) {
+ 		page_add_anon_rmap(page, vma, addr, false);
+ 		mem_cgroup_commit_charge(page, memcg, true, false);
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 806b0c7..d3b265f 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -112,7 +112,7 @@ static int mfill_zeropage_pte(struct mm_struct *dst_mm,
+ 	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+ 	if (!pte_none(*dst_pte))
+ 		goto out_unlock;
+-	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
++	set_epte_at(dst_mm, dst_addr, dst_pte, _dst_pte, ZERO_EPTE(0));
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache(dst_vma, dst_addr, dst_pte);
+ 	ret = 0;
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index fb42a5b..e81709c 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -61,10 +61,12 @@ static void free_work(struct work_struct *w)
+ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end)
+ {
+ 	pte_t *pte;
++	epte_t epte;
+ 
+ 	pte = pte_offset_kernel(pmd, addr);
+ 	do {
+-		pte_t ptent = ptep_get_and_clear(&init_mm, addr, pte);
++		pte_t ptent = eptep_get_and_clear(&init_mm, addr, pte, &epte);
++
+ 		WARN_ON(!pte_none(ptent) && !pte_present(ptent));
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ }
+@@ -136,7 +138,8 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr,
+ 			return -EBUSY;
+ 		if (WARN_ON(!page))
+ 			return -ENOMEM;
+-		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
++		set_epte_at(&init_mm, addr, pte, mk_pte(page, prot),
++			    ZERO_EPTE(0));
+ 		(*nr)++;
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 	return 0;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 71b1c29..ff9b082 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -48,6 +48,7 @@
+ #include <linux/printk.h>
+ #include <linux/dax.h>
+ 
++#include <asm/tlb.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+ 
+@@ -904,7 +905,9 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 	unsigned long nr_reclaimed = 0;
+ 	unsigned long nr_writeback = 0;
+ 	unsigned long nr_immediate = 0;
++	struct tlbflush_unmap_batch tlb_ubc;
+ 
++	init_tlb_ubc(&tlb_ubc);
+ 	cond_resched();
+ 
+ 	while (!list_empty(page_list)) {
+@@ -1072,7 +1075,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 		if (page_mapped(page) && mapping) {
+ 			switch (ret = try_to_unmap(page, lazyfree ?
+ 				(ttu_flags | TTU_BATCH_FLUSH | TTU_LZFREE) :
+-				(ttu_flags | TTU_BATCH_FLUSH))) {
++				(ttu_flags | TTU_BATCH_FLUSH), &tlb_ubc)) {
+ 			case SWAP_FAIL:
+ 				goto activate_locked;
+ 			case SWAP_AGAIN:
+@@ -1119,7 +1122,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 			 * potentially exists to avoid CPU writes after IO
+ 			 * starts and then write it out here.
+ 			 */
+-			try_to_unmap_flush_dirty();
++			try_to_unmap_flush_dirty(&tlb_ubc);
+ 			switch (pageout(page, mapping, sc)) {
+ 			case PAGE_KEEP:
+ 				goto keep_locked;
+@@ -1234,7 +1237,7 @@ keep:
+ 	}
+ 
+ 	mem_cgroup_uncharge_list(&free_pages);
+-	try_to_unmap_flush();
++	try_to_unmap_flush(&tlb_ubc);
+ 	free_hot_cold_page_list(&free_pages, true);
+ 
+ 	list_splice(&ret_pages, page_list);
+@@ -2182,7 +2185,7 @@ out:
+ }
+ 
+ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+-static void init_tlb_ubc(void)
++void init_tlb_ubc(struct tlbflush_unmap_batch *tlb_ubc)
+ {
+ 	/*
+ 	 * This deliberately does not clear the cpumask as it's expensive
+@@ -2190,7 +2193,8 @@ static void init_tlb_ubc(void)
+ 	 * first SWAP_CLUSTER_MAX pages will send an unnecessary IPI and
+ 	 * then will be cleared.
+ 	 */
+-	current->tlb_ubc.flush_required = false;
++	tlb_ubc->flush_required = false;
++	__tlb_reset_flush_tlb_info(&tlb_ubc->flush_info.info, false);
+ }
+ #else
+ static inline void init_tlb_ubc(void)
+@@ -2233,8 +2237,6 @@ static void shrink_zone_memcg(struct zone *zone, struct mem_cgroup *memcg,
+ 	scan_adjusted = (global_reclaim(sc) && !current_is_kswapd() &&
+ 			 sc->priority == DEF_PRIORITY);
+ 
+-	init_tlb_ubc();
+-
+ 	blk_start_plug(&plug);
+ 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
+ 					nr[LRU_INACTIVE_FILE]) {
